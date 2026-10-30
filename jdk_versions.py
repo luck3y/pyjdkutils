@@ -6,30 +6,31 @@ Data sources: Adoptium API (https://api.adoptium.net) for GA releases and
 https://jdk.java.net for the latest Oracle-led OpenJDK early-access build.
 
 Usage:
-    python3 jdk_versions.py                                   # LTS releases + latest feature release, as a table
-    python3 jdk_versions.py --all                             # every available major release
-    python3 jdk_versions.py --all --non-lts                   # every non-LTS major release
-    python3 jdk_versions.py --arch x64                        # only x64 downloads (works with all modes)
-    python3 jdk_versions.py --auto                            # only downloads for this machine's OS and architecture
-    python3 jdk_versions.py --auto --lts --count 1            # newest LTS download for this machine
-    python3 jdk_versions.py --auto --lts --download --target-directory jdks   # download the listed files
-    python3 jdk_versions.py --auto --lts --download --target-directory jdks --install --prefix-dir /java --install-prefix jdk   # also install them as /java/jdk25, /java/jdk21, ...
-    python3 jdk_versions.py --count 3                         # only the first 3 rows (works with all modes)
-    python3 jdk_versions.py --csv                             # CSV output (works with all modes)
-    python3 jdk_versions.py --ea                              # most recent early-access build
-    python3 jdk_versions.py --fields version os url           # only these fields (commas also work)
-    python3 jdk_versions.py --h                               # show help (also --help)
-    python3 jdk_versions.py --json                            # JSON output
-    python3 jdk_versions.py --list-arch                       # list all available architectures
-    python3 jdk_versions.py --list-os                         # list all available operating systems
-    python3 jdk_versions.py --lts                             # only LTS releases
-    python3 jdk_versions.py --lts --os macos --arch aarch64   # LTS releases, macOS/aarch64 only
-    python3 jdk_versions.py --lts --version-only              # LTS major versions, one per line
-    python3 jdk_versions.py --no-header                       # table or CSV without the header row
-    python3 jdk_versions.py --non-lts                         # only the latest non-LTS feature release
-    python3 jdk_versions.py --non-lts --version-only          # just the major version, e.g. 27
-    python3 jdk_versions.py --os linux                        # only linux downloads (works with all modes)
-    python3 jdk_versions.py --plain                           # no colors and no download progress bar
+    python3 jdk_versions.py                                                    # LTS releases + latest feature release, as a table
+    python3 jdk_versions.py --all                                              # every available major release
+    python3 jdk_versions.py --all --non-lts                                    # every non-LTS major release
+    python3 jdk_versions.py --arch x64                                         # only x64 downloads (works with all modes)
+    python3 jdk_versions.py --auto                                             # only downloads for this machine's OS and architecture
+    python3 jdk_versions.py --auto --lts --count 1                             # newest LTS download for this machine
+    python3 jdk_versions.py --auto --lts --download --target-directory jdks    # download the listed files
+    python3 jdk_versions.py --auto --lts --download --target-directory jdks --force   # re-download even if already up to date
+    python3 jdk_versions.py --auto --lts --install --target-directory jdks --prefix-dir /java --install-prefix jdk   # download + install as /java/jdk25, /java/jdk21, ...
+    python3 jdk_versions.py --count 3                                          # only the first 3 rows (works with all modes)
+    python3 jdk_versions.py --csv                                              # CSV output (works with all modes)
+    python3 jdk_versions.py --ea                                               # most recent early-access build
+    python3 jdk_versions.py --fields version os url                            # only these fields (commas also work)
+    python3 jdk_versions.py --h                                                # show help (also --help)
+    python3 jdk_versions.py --json                                             # JSON output
+    python3 jdk_versions.py --list-arch                                        # list all available architectures
+    python3 jdk_versions.py --list-os                                          # list all available operating systems
+    python3 jdk_versions.py --lts                                              # only LTS releases
+    python3 jdk_versions.py --lts --os macos --arch aarch64                    # LTS releases, macOS/aarch64 only
+    python3 jdk_versions.py --lts --version-only                               # LTS major versions, one per line
+    python3 jdk_versions.py --no-header                                        # table or CSV without the header row
+    python3 jdk_versions.py --non-lts                                          # only the latest non-LTS feature release
+    python3 jdk_versions.py --non-lts --version-only                           # just the major version, e.g. 27
+    python3 jdk_versions.py --os linux                                         # only linux downloads (works with all modes)
+    python3 jdk_versions.py --plain                                            # no colors and no download progress bar
 """
 import argparse
 import csv
@@ -618,13 +619,29 @@ def install_jdk(archive, major, prefix_dir, install_prefix):
     return dest
 
 
-def download_all(rows, directory, show_bar=False, installer=None):
+def file_matches_sha256(path, expected):
+    """True if the file at path exists and its SHA-256 digest matches expected."""
+    if not os.path.isfile(path):
+        return False
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            while chunk := fh.read(CHUNK_SIZE):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest() == expected
+
+
+def download_all(rows, directory, show_bar=False, installer=None, force=False):
     """Download every row's url into directory, reporting progress on stderr.
 
     With show_bar a progress bar is drawn for each file; otherwise one "downloading <name>" line
     is printed per file. installer, if given, is called with (archive_path, row) after each
-    verified download and returns where the JDK was installed. Returns the exit code: 0 if every
-    file downloaded, verified and installed, otherwise 1. A failed file does not stop the rest.
+    verified download and returns where the JDK was installed. When force is False (default) a
+    file whose SHA-256 already matches the remote checksum is skipped. Returns the exit code: 0
+    if every file downloaded, verified and installed, otherwise 1. A failed file does not stop
+    the rest.
     """
     try:
         os.makedirs(directory, exist_ok=True)
@@ -632,17 +649,37 @@ def download_all(rows, directory, show_bar=False, installer=None):
         print(json.dumps({"error": f"cannot use target directory '{directory}': {exc}"}),
               file=sys.stderr)
         return 1
-    download_failures = install_failures = installed = 0
+    download_failures = install_failures = installed = skipped = 0
     for row in rows:
         try:
             name = filename_from_url(row["url"])
+            archive = os.path.join(directory, name)
+            if not force:
+                try:
+                    expected = parse_sha256(fetch(row["sha256_url"], "text/plain"))
+                except (*NETWORK_ERRORS, ValueError) as exc:
+                    print(json.dumps({"error": f"failed to fetch checksum for {name}: {exc}"}),
+                          file=sys.stderr)
+                    download_failures += 1
+                    continue
+                if file_matches_sha256(archive, expected):
+                    print(f"skipping {name} (already up to date)", file=sys.stderr)
+                    skipped += 1
+                    if installer:
+                        try:
+                            print(f"installed {installer(archive, row)}", file=sys.stderr)
+                            installed += 1
+                        except INSTALL_ERRORS as exc:
+                            print(json.dumps({"error": f"failed to install {name}: {exc}"}),
+                                  file=sys.stderr)
+                            install_failures += 1
+                    continue
             make_progress = None
             if show_bar:
                 def make_progress(total, name=name):
                     return ProgressBar(name, total, color=use_color(sys.stderr))
             else:
                 print(f"downloading {name}", file=sys.stderr)
-            archive = os.path.join(directory, name)
             download_verified(row["url"], row["sha256_url"], archive, make_progress)
         except (*NETWORK_ERRORS, ValueError) as exc:
             print(json.dumps({"error": f"failed to download {row['url']}: {exc}"}), file=sys.stderr)
@@ -655,7 +692,9 @@ def download_all(rows, directory, show_bar=False, installer=None):
             except INSTALL_ERRORS as exc:
                 print(json.dumps({"error": f"failed to install {name}: {exc}"}), file=sys.stderr)
                 install_failures += 1
-    print(f"downloaded {len(rows) - download_failures} of {len(rows)} file(s) to {directory}",
+    downloaded = len(rows) - download_failures - skipped
+    print(f"downloaded {downloaded} of {len(rows)} file(s) to {directory}"
+          + (f" ({skipped} skipped, already up to date)" if skipped else ""),
           file=sys.stderr)
     if installer:
         print(f"installed {installed} of {len(rows)} JDK(s)", file=sys.stderr)
@@ -742,7 +781,7 @@ def finish_downloads(rows, args, show_bar):
 
         def installer(archive, row):
             return install_jdk(archive, row["major"], args.prefix_dir, args.install_prefix)
-    return download_all(rows, args.target_directory, show_bar, installer)
+    return download_all(rows, args.target_directory, show_bar, installer, force=args.force)
 
 
 def main():
@@ -803,7 +842,8 @@ def main():
         "--download", action="store_true",
         help="download every listed result (after --os, --arch, --count and the other filters) "
              "into --target-directory, checking each against its SHA-256 checksum. Progress goes "
-             "to stderr. Not available with --list-arch, --list-os or --version-only",
+             "to stderr. Not available with --list-arch, --list-os or --version-only. Implied "
+             "by --install",
     )
     parser.add_argument(
         "--target-directory", metavar="DIR",
@@ -814,8 +854,8 @@ def main():
         help="unpack each downloaded JDK into --prefix-dir, as a directory named "
              "--install-prefix followed by the major version (--prefix-dir /java "
              "--install-prefix jdk puts JDK 27 in /java/jdk27). The directory holds the JDK "
-             "itself (bin/, lib/ and so on) with no versioned directory inside it. Needs "
-             "--download, and one download per major version. An existing JDK there is replaced",
+             "itself (bin/, lib/ and so on) with no versioned directory inside it. Implies "
+             "--download; one download per major version. An existing JDK there is replaced",
     )
     parser.add_argument(
         "--prefix-dir", metavar="DIR",
@@ -825,6 +865,11 @@ def main():
         "--install-prefix", type=install_prefix_name, metavar="PREFIX",
         help="the start of each install directory's name; the major version is added to it "
              "(jdk -> jdk27). Letters, digits, '.', '_', '+' and '-' only",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="re-download a file even if the local copy already matches the remote SHA-256 "
+             "checksum (default: skip files that are already up to date)",
     )
     parser.add_argument(
         "--plain", action="store_true",
@@ -841,8 +886,10 @@ def main():
         parser.error("argument --version-only: not allowed with --list-arch or --list-os")
     if args.auto and (args.list_arch or args.list_os):
         parser.error("argument --auto: not allowed with --list-arch or --list-os")
+    if args.install and not args.download:
+        args.download = True
     if args.download and args.target_directory is None:
-        parser.error("argument --download: requires --target-directory")
+        parser.error("argument --download/--install: requires --target-directory")
     if args.target_directory is not None and not args.download:
         parser.error("argument --target-directory: requires --download")
     if args.download and (args.list_arch or args.list_os or args.version_only):
@@ -850,8 +897,6 @@ def main():
                      "--version-only")
     install_args = {"--prefix-dir": args.prefix_dir, "--install-prefix": args.install_prefix}
     if args.install:
-        if not args.download:
-            parser.error("argument --install: requires --download")
         for flag, value in install_args.items():
             if value is None:
                 parser.error(f"argument --install: requires {flag}")
