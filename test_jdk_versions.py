@@ -9,10 +9,14 @@ Run with:
 """
 import contextlib
 import csv
+import hashlib
 import http.client
 import io
 import json
+import os
+import re
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -68,8 +72,16 @@ def asset(major, os_name, arch):
     }
 
 
+def payload_for(url):
+    """The fake file content served for a download URL."""
+    return b"JDK:" + url.encode()
+
+
 def fake_fetch(url, accept):
     """Stand-in for jdk_versions.fetch that serves canned responses."""
+    if url.endswith((".sha256.txt", ".sha256")):
+        data = payload_for(url.rsplit(".sha256", 1)[0])
+        return hashlib.sha256(data).hexdigest() + "  " + url.rsplit("/", 1)[-1]
     if url.startswith(j.API):
         path = url[len(j.API):]
         if path == "/info/available_releases":
@@ -969,6 +981,707 @@ class NetworkFailureTests(unittest.TestCase):
     def test_retry_free_success_still_works_after_failures(self):
         self.assert_clean_failure(("--lts",), raising(BrokenPipeError()))
         self.assertEqual(run("--lts", "--version-only")[0], 0)
+
+
+class FilenameFromUrlTests(unittest.TestCase):
+    def test_takes_the_last_path_segment_and_decodes_it(self):
+        self.assertEqual(j.filename_from_url("https://h.test/a/b/OpenJDK_x64.tar.gz"),
+                         "OpenJDK_x64.tar.gz")
+        self.assertEqual(j.filename_from_url("https://h.test/a/openjdk-28-ea%2B21_bin.zip?x=1"),
+                         "openjdk-28-ea+21_bin.zip")
+
+    def test_rejects_unsafe_urls(self):
+        for url in ("http://h.test/a.zip", "https://h.test/", "https://h.test/a/..",
+                    "https://h.test/a/%2E%2E", "https://h.test/a/b%5Cc.zip",
+                    "https://h.test/a/c%3Ad.zip", "ftp://h.test/a.zip"):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    j.filename_from_url(url)
+
+    def test_path_traversal_in_the_name_is_flattened(self):
+        self.assertEqual(j.filename_from_url("https://h.test/a/..%2F..%2Fevil.zip"), "evil.zip")
+
+
+class ParseSha256Tests(unittest.TestCase):
+    DIGEST = "ab" * 32
+
+    def test_accepts_the_common_layouts(self):
+        for text in (self.DIGEST, self.DIGEST + "\n", f"{self.DIGEST}  file.tar.gz\n",
+                     self.DIGEST.upper()):
+            with self.subTest(text=text):
+                self.assertEqual(j.parse_sha256(text), self.DIGEST)
+
+    def test_rejects_anything_else(self):
+        for text in ("", "   ", "nothex", "ab" * 31, "ab" * 33, "<html>" + self.DIGEST):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    j.parse_sha256(text)
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def fake_urlopen(corrupt=(), fail=(), seen=None, announce=False):
+    """Stand-in for urllib.request.urlopen that serves payload_for(url).
+
+    URLs containing any string in `corrupt` return wrong bytes; those in `fail` raise OSError.
+    With announce=True the response carries a Content-Length header, as real servers send.
+    """
+    def urlopen(req, timeout=None):
+        url = req.full_url
+        if seen is not None:
+            seen.append((url, timeout))
+        if any(f in url for f in fail):
+            raise OSError("connection refused")
+        data = payload_for(url)
+        if any(c in url for c in corrupt):
+            data = data + b"tampered"
+        resp = FakeResponse(data)
+        resp.headers = {"Content-Length": str(len(data))} if announce else {}
+        return resp
+    return urlopen
+
+
+class DownloadTests(unittest.TestCase):
+    BASE = ("--lts", "--os", "linux", "--arch", "x64", "--download")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = os.path.join(tmp.name, "out")  # does not exist yet
+
+    def go(self, *argv, urlopen=None, **kw):
+        with mock.patch.object(j.urllib.request, "urlopen", urlopen or fake_urlopen()):
+            return run(*argv, "--target-directory", self.dir, **kw)
+
+    def files(self):
+        return sorted(os.listdir(self.dir)) if os.path.isdir(self.dir) else []
+
+    def test_downloads_every_listed_row_and_creates_the_directory(self):
+        code, out, err = self.go(*self.BASE, "--csv")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.files(), [
+            "OpenJDK17U-jdk_x64_linux_hotspot_17.0.1_1.tar.gz",
+            "OpenJDK21U-jdk_x64_linux_hotspot_21.0.1_1.tar.gz",
+            "OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_1.tar.gz",
+            "OpenJDK8U-jdk_x64_linux_hotspot_8.0.1_1.tar.gz",
+        ])
+        self.assertIn("downloaded 4 of 4 file(s)", err)
+
+    def test_file_contents_are_what_the_server_sent(self):
+        self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1", "--download")
+        (name,) = self.files()
+        with open(os.path.join(self.dir, name), "rb") as f:
+            self.assertEqual(f.read(), payload_for(
+                "https://example.test/jdk-25/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_1.tar.gz"))
+
+    def test_the_normal_listing_still_goes_to_stdout(self):
+        code, out, err = self.go(*self.BASE, "--count", "2")
+        self.assertEqual(code, 0, err)
+        self.assertIn("OpenJDK25U", out)
+        self.assertNotIn("downloading", out)
+        self.assertIn("downloading OpenJDK25U", err)
+
+    def test_json_on_stdout_stays_valid_while_downloading(self):
+        code, out, err = self.go(*self.BASE, "--count", "2", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(json.loads(out)["releases"]), 2)
+
+    def test_count_limits_how_many_files_are_downloaded(self):
+        self.go(*self.BASE, "--count", "2")
+        self.assertEqual(len(self.files()), 2)
+
+    def test_filters_apply_to_what_is_downloaded(self):
+        self.go("--lts", "--os", "mac", "--arch", "x64", "--download")
+        self.assertEqual(self.files(), ["OpenJDK17U-jdk_x64_mac_hotspot_17.0.1_1.tar.gz",
+                                        "OpenJDK21U-jdk_x64_mac_hotspot_21.0.1_1.tar.gz",
+                                        "OpenJDK25U-jdk_x64_mac_hotspot_25.0.1_1.tar.gz"])
+
+    def test_works_with_early_access_builds(self):
+        code, _, err = self.go("--ea", "--os", "linux", "--arch", "x64", "--download")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.files(), ["openjdk-28-ea+21_linux-x64_bin.tar.gz"])
+
+    def test_sends_the_timeout_and_uses_https(self):
+        seen = []
+        self.go(*self.BASE, "--count", "1", urlopen=fake_urlopen(seen=seen))
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0][0].startswith("https://"))
+        self.assertEqual(seen[0][1], j.TIMEOUT)
+
+    def test_a_checksum_mismatch_fails_and_leaves_no_file(self):
+        code, out, err = self.go(*self.BASE, "--count", "1",
+                                 urlopen=fake_urlopen(corrupt=["jdk-25"]))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.files(), [])
+        self.assertIn("checksum mismatch", err)
+        self.assertIn("downloaded 0 of 1", err)
+
+    def test_one_failure_does_not_stop_the_others(self):
+        code, _, err = self.go(*self.BASE, "--count", "3",
+                               urlopen=fake_urlopen(fail=["jdk-21"]))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.files(), ["OpenJDK17U-jdk_x64_linux_hotspot_17.0.1_1.tar.gz",
+                                        "OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_1.tar.gz"])
+        self.assertIn("failed to download", err)
+        self.assertIn("downloaded 2 of 3", err)
+        for line in err.splitlines():
+            if line.startswith("{"):
+                self.assertIn("error", json.loads(line))
+
+    def test_a_bad_checksum_file_fails_cleanly(self):
+        def bad_fetch(url, accept):
+            return "not a digest" if url.endswith(".sha256.txt") else fake_fetch(url, accept)
+        code, _, err = self.go(*self.BASE, "--count", "1", fetch=bad_fetch)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.files(), [])
+        self.assertIn("SHA-256", err)
+
+    def test_an_unusable_target_directory_is_a_runtime_error(self):
+        with tempfile.NamedTemporaryFile() as blocker:
+            self.dir = os.path.join(blocker.name, "sub")  # a file is in the way
+            code, out, err = self.go(*self.BASE, "--count", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot use target directory", err)
+        self.assertEqual(json.loads(err.strip())["error"].split(":")[0],
+                         f"cannot use target directory '{self.dir}'")
+
+    def test_an_existing_directory_is_reused(self):
+        os.makedirs(self.dir)
+        code, _, err = self.go(*self.BASE, "--count", "1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.files()), 1)
+
+    def test_no_part_files_are_left_behind(self):
+        self.go(*self.BASE, "--count", "2")
+        self.assertFalse([f for f in self.files() if f.endswith(".part")])
+
+    def test_nothing_is_downloaded_without_the_flag(self):
+        with mock.patch.object(j.urllib.request, "urlopen",
+                               side_effect=AssertionError("no download expected")):
+            code, _, _ = run("--lts", "--count", "1")
+        self.assertEqual(code, 0)
+
+    def test_no_match_means_no_download_and_exit_1(self):
+        code, _, err = self.go("--os", "foo", "--download")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.files(), [])
+
+    def test_a_download_that_raises_unexpectedly_still_cleans_up(self):
+        def boom(req, timeout=None):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.go(*self.BASE, "--count", "1", urlopen=boom)
+        self.assertEqual(self.files(), [])
+
+
+class DownloadArgumentTests(unittest.TestCase):
+    def assert_rejected(self, *argv):
+        code, out, err = run(*argv, fetch=raising(AssertionError("no network!")))
+        self.assertEqual(code, 2, f"{argv} should be rejected (stderr: {err})")
+        self.assertEqual(out, "")
+
+    def test_download_needs_a_target_directory(self):
+        self.assert_rejected("--lts", "--download")
+
+    def test_target_directory_needs_download(self):
+        self.assert_rejected("--lts", "--target-directory", "x")
+
+    def test_not_allowed_with_list_or_version_only_modes(self):
+        for mode in ("--list-arch", "--list-os", "--version-only"):
+            with self.subTest(mode=mode):
+                self.assert_rejected(mode, "--download", "--target-directory", "x")
+
+    def test_target_directory_needs_a_value(self):
+        self.assert_rejected("--download", "--target-directory")
+
+    def test_both_flags_appear_in_the_help(self):
+        _, out, _ = run("--h")
+        self.assertIn("--download", out)
+        self.assertIn("--target-directory", out)
+
+
+class FakeStream(io.StringIO):
+    """A text stream that claims to be (or not to be) a terminal."""
+
+    def __init__(self, tty=True):
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text):
+    return ANSI.sub("", text)
+
+
+class StyleTests(unittest.TestCase):
+    def test_style_wraps_and_resets(self):
+        self.assertEqual(j.style("x", j.BOLD, j.CYAN), "\x1b[1;36mx\x1b[0m")
+        self.assertEqual(j.style("x"), "x")
+
+
+class InteractiveTests(unittest.TestCase):
+    def env(self, **values):
+        env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "TERM")}
+        env.update(values)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_a_terminal_is_interactive(self):
+        with self.env(TERM="xterm"):
+            self.assertTrue(j.is_interactive(FakeStream(True)))
+
+    def test_pipes_files_and_dumb_terminals_are_not(self):
+        with self.env(TERM="xterm"):
+            self.assertFalse(j.is_interactive(FakeStream(False)))
+            self.assertFalse(j.is_interactive(io.StringIO()))
+            self.assertFalse(j.is_interactive(object()))
+        with self.env(TERM="dumb"):
+            self.assertFalse(j.is_interactive(FakeStream(True)))
+
+    def test_color_needs_a_terminal(self):
+        with self.env(TERM="xterm"), mock.patch.object(j.sys, "platform", "linux"):
+            self.assertTrue(j.use_color(FakeStream(True)))
+            self.assertFalse(j.use_color(FakeStream(False)))
+
+    def test_no_color_turns_color_off_even_on_a_terminal(self):
+        for value in ("1", "yes", "anything"):
+            with self.subTest(value=value), self.env(TERM="xterm", NO_COLOR=value):
+                self.assertFalse(j.use_color(FakeStream(True)))
+
+    def test_an_empty_no_color_is_ignored(self):
+        with self.env(TERM="xterm", NO_COLOR=""), mock.patch.object(j.sys, "platform", "linux"):
+            self.assertTrue(j.use_color(FakeStream(True)))
+
+    def test_windows_needs_a_terminal_that_understands_escapes(self):
+        with mock.patch.object(j.sys, "platform", "win32"):
+            with self.env(TERM="xterm"):
+                self.assertFalse(j.use_color(FakeStream(True)))
+            with self.env(TERM="xterm", WT_SESSION="abc"):
+                self.assertTrue(j.use_color(FakeStream(True)))
+
+
+class ColorTableTests(unittest.TestCase):
+    COLUMNS = ["major", "version", "lts", "url"]
+    ROWS = [
+        {"major": 25, "version": "25.0.1+1", "lts": True, "url": "https://x.test/a"},
+        {"major": 27, "version": "27", "lts": False, "url": "https://x.test/bb"},
+    ]
+
+    def test_plain_output_has_no_escape_codes(self):
+        self.assertNotIn("\x1b", j.format_table(self.COLUMNS, self.ROWS))
+        self.assertNotIn("\x1b", j.format_table(self.COLUMNS, self.ROWS, color=False))
+
+    def test_color_only_adds_escape_codes(self):
+        plain = j.format_table(self.COLUMNS, self.ROWS)
+        colored = j.format_table(self.COLUMNS, self.ROWS, color=True)
+        self.assertIn("\x1b[", colored)
+        self.assertEqual(strip_ansi(colored), plain)
+
+    def test_columns_stay_aligned_when_colored(self):
+        colored = j.format_table(self.COLUMNS, self.ROWS, color=True)
+        widths = {len(line) for line in strip_ansi(colored).splitlines()}
+        self.assertEqual(len(widths), 1)
+
+    def test_header_cells_are_bold_cyan(self):
+        colored = j.format_table(self.COLUMNS, self.ROWS, color=True)
+        self.assertIn("\x1b[1;36mmajor\x1b[0m", colored)
+
+    def test_lts_is_green_and_non_lts_is_yellow(self):
+        lines = j.format_table(self.COLUMNS, self.ROWS, color=True).splitlines()
+        # The padding is inside the color so that the columns stay aligned.
+        self.assertIn("\x1b[32mtrue \x1b[0m", [l for l in lines if "25.0.1" in l][0])
+        self.assertIn("\x1b[33mfalse\x1b[0m", [l for l in lines if "27" in l and "false" in l][0])
+
+    def test_version_and_url_columns_have_their_own_colors(self):
+        colored = j.format_table(self.COLUMNS, self.ROWS, color=True)
+        self.assertIn("\x1b[1m25.0.1+1\x1b[0m", colored)
+        self.assertIn("\x1b[34mhttps://x.test/a \x1b[0m", colored)
+
+    def test_cell_codes(self):
+        self.assertEqual(j.cell_codes("lts", "true"), (j.GREEN,))
+        self.assertEqual(j.cell_codes("lts", "false"), (j.YELLOW,))
+        self.assertEqual(j.cell_codes("os", "linux"), ())
+
+    def test_no_header_color_table(self):
+        out = j.format_table(self.COLUMNS, self.ROWS, header=False, color=True)
+        self.assertEqual(len(out.splitlines()), 4)
+        self.assertNotIn("\x1b[1;36m", out)
+
+    def test_emit_colors_only_the_table(self):
+        payload = {"source": "s", "arch": None, "os": None}
+        for fmt in ("csv", "json"):
+            with self.subTest(fmt=fmt):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    j.emit(payload, fmt, self.COLUMNS, self.ROWS, color=True)
+                self.assertNotIn("\x1b", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            j.emit(payload, "table", self.COLUMNS, self.ROWS, color=True)
+        self.assertIn("\x1b[", out.getvalue())
+
+
+class FormatSizeTests(unittest.TestCase):
+    def test_units(self):
+        for num, text in [(0, "0 B"), (512, "512 B"), (1023, "1023 B"), (1024, "1.0 KiB"),
+                          (1536, "1.5 KiB"), (1024 ** 2, "1.0 MiB"),
+                          (int(141.3 * 1024 ** 2), "141.3 MiB"), (1024 ** 3, "1.0 GiB"),
+                          (int(2.5 * 1024 ** 3), "2.5 GiB"), (5 * 1024 ** 4, "5120.0 GiB")]:
+            with self.subTest(num=num):
+                self.assertEqual(j.format_size(num), text)
+
+
+class ContentLengthTests(unittest.TestCase):
+    def resp(self, value):
+        return mock.Mock(headers={} if value is None else {"Content-Length": value})
+
+    def test_reads_a_valid_length(self):
+        self.assertEqual(j.content_length(self.resp("12345")), 12345)
+
+    def test_missing_zero_negative_or_bad_lengths_are_unknown(self):
+        for value in (None, "0", "-5", "abc", ""):
+            with self.subTest(value=value):
+                self.assertIsNone(j.content_length(self.resp(value)))
+
+    def test_a_response_without_headers_is_unknown(self):
+        self.assertIsNone(j.content_length(object()))
+        self.assertIsNone(j.content_length(mock.Mock(headers=None)))
+
+
+class TerminalWidthTests(unittest.TestCase):
+    def test_uses_the_terminal_size(self):
+        stream = mock.Mock()
+        with mock.patch.object(j.os, "get_terminal_size", return_value=os.terminal_size((132, 40))):
+            self.assertEqual(j.terminal_width(stream), 132)
+
+    def test_falls_back_when_it_cannot_be_found_or_is_zero(self):
+        with mock.patch.object(j.os, "get_terminal_size", side_effect=OSError):
+            self.assertEqual(j.terminal_width(mock.Mock()), 80)
+        self.assertEqual(j.terminal_width(io.StringIO()), 80)
+        with mock.patch.object(j.os, "get_terminal_size", return_value=os.terminal_size((0, 0))):
+            self.assertEqual(j.terminal_width(mock.Mock()), 80)
+
+
+class Clock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+class ProgressBarTests(unittest.TestCase):
+    def make(self, total=1000, color=False, width=100, name="jdk.tar.gz"):
+        self.clock = Clock()
+        self.stream = FakeStream()
+        return j.ProgressBar(name, total, stream=self.stream, color=color, width=width,
+                             clock=self.clock)
+
+    def test_line_shows_name_bar_percent_sizes_and_speed(self):
+        bar = self.make(total=1000)
+        bar.done = 500
+        self.clock.now += 2
+        text, length = bar.line()
+        self.assertEqual(text, "jdk.tar.gz [##########----------]  50% 500 B/1000 B 250 B/s")
+        self.assertEqual(length, len(text))
+
+    def test_the_bar_fills_up_and_never_overflows(self):
+        bar = self.make(total=1000)
+        self.clock.now += 1
+        bar.done = 0
+        self.assertIn("[--------------------]   0%", bar.line()[0])
+        bar.done = 1000
+        self.assertIn("[####################] 100%", bar.line()[0])
+        bar.done = 5000  # more data than announced
+        self.assertIn("[####################] 100%", bar.line()[0])
+
+    def test_unknown_total_has_no_bar_or_percentage(self):
+        bar = self.make(total=None)
+        bar.done = 2048
+        self.clock.now += 1
+        text, _ = bar.line()
+        self.assertEqual(text, "jdk.tar.gz  2.0 KiB 2.0 KiB/s")
+        self.assertNotIn("[", text)
+        self.assertNotIn("%", text)
+
+    def test_a_long_name_is_shortened_to_fit_the_width(self):
+        bar = self.make(total=1000, width=60, name="OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz")
+        bar.done = 100
+        self.clock.now += 1
+        text, length = bar.line()
+        self.assertLessEqual(length, 59)
+        self.assertIn("...", text)
+        self.assertTrue(text.endswith("B/s"))
+
+    def test_a_tiny_width_does_not_crash(self):
+        bar = self.make(width=5, name="OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz")
+        bar.done = 1
+        self.clock.now += 1
+        text, _ = bar.line()
+        self.assertTrue(text.startswith("OpenJ..."))  # the name is cut to a minimum of 8 columns
+        bar.draw()
+        bar.finish()
+
+    def test_color_adds_escapes_and_plain_does_not(self):
+        bar = self.make(color=False)
+        bar.done = 500
+        self.assertNotIn("\x1b", bar.line()[0])
+        colored = self.make(color=True)
+        colored.done = 500
+        text, length = colored.line()
+        self.assertIn("\x1b[32m##########\x1b[0m", text)
+        self.assertEqual(len(strip_ansi(text)), length)
+
+    def test_updates_are_throttled(self):
+        bar = self.make()
+        bar.update(100)  # no time has passed
+        self.assertEqual(self.stream.getvalue(), "")
+        self.clock.now += 2 * j.BAR_INTERVAL
+        bar.update(200)
+        self.assertEqual(self.stream.getvalue().count("\r"), 1)
+        bar.update(300)  # too soon again
+        self.assertEqual(self.stream.getvalue().count("\r"), 1)
+
+    def test_drawing_redraws_in_place_and_blanks_leftovers(self):
+        bar = self.make()
+        bar.drawn = 200  # a longer line was drawn before
+        bar.draw()
+        out = self.stream.getvalue()
+        self.assertTrue(out.startswith("\r"))
+        self.assertNotIn("\n", out)
+        self.assertGreaterEqual(len(out) - 1, 200)
+
+    def test_finish_draws_the_final_state_and_ends_the_line(self):
+        bar = self.make()
+        bar.done = 1000
+        self.clock.now += 1
+        bar.finish()
+        self.assertTrue(self.stream.getvalue().endswith("\n"))
+        self.assertIn("100%", self.stream.getvalue())
+
+    def test_abort_erases_the_bar(self):
+        bar = self.make()
+        bar.abort()  # nothing drawn yet: nothing to erase
+        self.assertEqual(self.stream.getvalue(), "")
+        bar.drawn = 30
+        bar.abort()
+        self.assertEqual(self.stream.getvalue(), "\r" + " " * 30 + "\r")
+
+
+class FakeBar:
+    def __init__(self, total):
+        self.total, self.updates, self.state = total, [], "open"
+
+    def update(self, done):
+        self.updates.append(done)
+
+    def finish(self):
+        self.state = "finished"
+
+    def abort(self):
+        self.state = "aborted"
+
+
+class DownloadProgressTests(unittest.TestCase):
+    URL = "https://example.test/jdk.tar.gz"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dest = os.path.join(tmp.name, "jdk.tar.gz")
+        self.bars = []
+
+    def make_bar(self, total):
+        self.bars.append(FakeBar(total))
+        return self.bars[-1]
+
+    def download(self, urlopen):
+        with mock.patch.object(j.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(j, "fetch", fake_fetch):
+            j.download_verified(self.URL, self.URL + ".sha256.txt", self.dest, self.make_bar)
+
+    def test_progress_is_reported_and_finished_on_success(self):
+        with mock.patch.object(j, "CHUNK_SIZE", 10):
+            self.download(fake_urlopen())
+        (bar,) = self.bars
+        self.assertEqual(bar.state, "finished")
+        size = len(payload_for(self.URL))
+        self.assertEqual(bar.updates[-1], size)
+        self.assertEqual(bar.updates, sorted(bar.updates))
+        self.assertGreater(len(bar.updates), 1)
+
+    def test_the_total_comes_from_content_length(self):
+        def urlopen(req, timeout=None):
+            resp = FakeResponse(payload_for(req.full_url))
+            resp.headers = {"Content-Length": str(len(payload_for(req.full_url)))}
+            return resp
+        self.download(urlopen)
+        self.assertEqual(self.bars[0].total, len(payload_for(self.URL)))
+
+    def test_an_unknown_total_is_passed_as_none(self):
+        self.download(fake_urlopen())
+        self.assertIsNone(self.bars[0].total)
+
+    def test_the_bar_is_aborted_when_the_checksum_fails(self):
+        with self.assertRaises(ValueError):
+            self.download(fake_urlopen(corrupt=["jdk"]))
+        self.assertEqual(self.bars[0].state, "aborted")
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_the_bar_is_aborted_when_the_connection_fails_midway(self):
+        class Dying(FakeResponse):
+            def read(self, n=-1):
+                raise ConnectionResetError("reset")
+        with self.assertRaises(ConnectionResetError):
+            self.download(lambda req, timeout=None: Dying(b"x"))
+        self.assertEqual(self.bars[0].state, "aborted")
+
+    def test_no_bar_is_made_when_the_connection_cannot_be_opened(self):
+        with self.assertRaises(OSError):
+            self.download(fake_urlopen(fail=["jdk"]))
+        self.assertEqual(self.bars, [])
+
+    def test_no_progress_callback_works_as_before(self):
+        with mock.patch.object(j.urllib.request, "urlopen", fake_urlopen()), \
+                mock.patch.object(j, "fetch", fake_fetch):
+            j.download_verified(self.URL, self.URL + ".sha256.txt", self.dest)
+        self.assertTrue(os.path.exists(self.dest))
+
+
+class PlainFlagTests(unittest.TestCase):
+    """--plain, and how main() decides whether to color and whether to draw a progress bar."""
+
+    BASE = ("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = os.path.join(tmp.name, "out")
+        env = mock.patch.dict(os.environ, {"TERM": "xterm"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("NO_COLOR", None)
+        platform_patch = mock.patch.object(j.sys, "platform", "linux")
+        platform_patch.start()
+        self.addCleanup(platform_patch.stop)
+
+    def run_tty(self, *argv, stdout_tty=True, stderr_tty=True):
+        out, err = FakeStream(stdout_tty), FakeStream(stderr_tty)
+        with mock.patch.object(j, "fetch", fake_fetch), \
+                mock.patch.object(j.urllib.request, "urlopen", fake_urlopen(announce=True)), \
+                mock.patch.object(sys, "argv", ["jdk_versions.py", *argv]), \
+                mock.patch.object(j, "terminal_width", return_value=100), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = j.main()
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_table_is_colored_on_a_terminal(self):
+        code, out, _ = self.run_tty(*self.BASE)
+        self.assertEqual(code, 0)
+        self.assertIn("\x1b[", out)
+
+    def test_plain_turns_color_off(self):
+        _, out, _ = self.run_tty(*self.BASE, "--plain")
+        self.assertNotIn("\x1b", out)
+
+    def test_plain_output_is_the_same_text_as_colored_output(self):
+        _, colored, _ = self.run_tty(*self.BASE)
+        _, plain, _ = self.run_tty(*self.BASE, "--plain")
+        self.assertEqual(strip_ansi(colored), plain)
+
+    def test_no_color_when_stdout_is_not_a_terminal(self):
+        _, out, _ = self.run_tty(*self.BASE, stdout_tty=False)
+        self.assertNotIn("\x1b", out)
+
+    def test_no_color_when_no_color_is_set(self):
+        os.environ["NO_COLOR"] = "1"
+        _, out, _ = self.run_tty(*self.BASE)
+        self.assertNotIn("\x1b", out)
+
+    def test_csv_and_json_are_never_colored(self):
+        for flag in ("--csv", "--json"):
+            with self.subTest(flag=flag):
+                _, out, _ = self.run_tty(*self.BASE, flag)
+                self.assertNotIn("\x1b", out)
+
+    def test_list_and_early_access_tables_are_colored_too(self):
+        for argv in (("--list-os",), ("--list-arch",), ("--ea", "--os", "linux")):
+            with self.subTest(argv=argv):
+                _, out, _ = self.run_tty(*argv)
+                self.assertIn("\x1b[", out)
+
+    def test_run_helper_output_is_plain_because_it_is_not_a_terminal(self):
+        _, out, _ = run(*self.BASE)
+        self.assertNotIn("\x1b", out)
+
+    def test_a_progress_bar_is_drawn_on_a_terminal(self):
+        code, out, err = self.run_tty(*self.BASE, "--download", "--target-directory", self.dir)
+        self.assertEqual(code, 0, err)
+        self.assertIn("\r", err)
+        self.assertIn("100%", err)
+        self.assertNotIn("downloading OpenJDK", err)
+        self.assertIn("downloaded 1 of 1 file(s)", err)
+
+    def test_the_bar_is_colored_on_a_terminal(self):
+        _, _, err = self.run_tty(*self.BASE, "--download", "--target-directory", self.dir)
+        self.assertIn("\x1b[", err)
+
+    def test_the_bar_shows_the_file_name(self):
+        _, _, err = self.run_tty(*self.BASE, "--download", "--target-directory", self.dir)
+        self.assertIn("OpenJDK25U", strip_ansi(err))
+
+    def test_plain_gives_simple_progress_lines_instead_of_a_bar(self):
+        code, _, err = self.run_tty(*self.BASE, "--download", "--target-directory", self.dir,
+                                    "--plain")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("\r", err)
+        self.assertNotIn("\x1b", err)
+        self.assertIn("downloading OpenJDK25U", err)
+
+    def test_no_bar_when_stderr_is_not_a_terminal(self):
+        _, _, err = self.run_tty(*self.BASE, "--download", "--target-directory", self.dir,
+                                 stderr_tty=False)
+        self.assertNotIn("\r", err)
+        self.assertIn("downloading OpenJDK25U", err)
+
+    def test_the_bar_can_be_on_while_stdout_is_piped(self):
+        _, out, err = self.run_tty(*self.BASE, "--download", "--target-directory", self.dir,
+                                   stdout_tty=False)
+        self.assertNotIn("\x1b", out)
+        self.assertIn("\r", err)
+
+    def test_a_failed_download_erases_the_bar_before_the_error(self):
+        out, err = FakeStream(True), FakeStream(True)
+        with mock.patch.object(j, "fetch", fake_fetch), \
+                mock.patch.object(j.urllib.request, "urlopen", fake_urlopen(corrupt=["jdk-25"])), \
+                mock.patch.object(sys, "argv", ["jdk_versions.py", *self.BASE, "--download",
+                                                "--target-directory", self.dir]), \
+                mock.patch.object(j, "terminal_width", return_value=100), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = j.main()
+        self.assertEqual(code, 1)
+        self.assertIn("checksum mismatch", err.getvalue())
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_plain_is_accepted_everywhere_and_in_the_help(self):
+        for argv in (("--list-os", "--plain"), ("--ea", "--plain"), ("--plain", "--json"),
+                     ("--plain", "--version-only")):
+            with self.subTest(argv=argv):
+                self.assertEqual(run(*argv)[0], 0)
+        self.assertIn("--plain", run("--h")[1])
 
 
 class NetworkErrorsConstantTests(unittest.TestCase):

@@ -21,6 +21,8 @@ tested on Python 3.14.
 - [Options](#options)
 - [Output formats](#output-formats)
   - [Choosing fields](#choosing-fields)
+- [Downloading files](#downloading-files)
+- [Colors and the progress bar](#colors-and-the-progress-bar)
 - [How filtering and `--count` work](#how-filtering-and---count-work)
 - [Platform names](#platform-names)
 - [Exit codes and errors](#exit-codes-and-errors)
@@ -196,6 +198,9 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--csv` | Prints CSV instead of a table. |
 | `--no-header` | Leaves out the header row in table and CSV output. JSON is unaffected. |
 | `--fields FIELD ...` | Outputs only these fields, in this order. See [Choosing fields](#choosing-fields). |
+| `--download` | Downloads every listed result into `--target-directory`. See [Downloading files](#downloading-files). |
+| `--target-directory DIR` | The directory `--download` saves files in. It is created if it does not exist. |
+| `--plain` | Turns off the colors and the download progress bar. See [Colors and the progress bar](#colors-and-the-progress-bar). |
 | `--h`, `--help` | Shows the help text. Note that `-h` is not accepted. |
 
 Rules for combining options:
@@ -204,9 +209,11 @@ Rules for combining options:
 - `--json` and `--csv` are mutually exclusive.
 - `--auto` and `--version-only` cannot be used with `--list-arch` or `--list-os`.
 - `--fields` cannot be used with `--version-only`.
+- `--download` and `--target-directory` must be used together. `--download` cannot be used with
+  `--version-only`, `--list-arch` or `--list-os`.
 - `--count` must be a whole number of 1 or more.
-- Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header` and the
-  output formats work with `--ea` too.
+- Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--download`, `--plain`
+  and the output formats work with `--ea` too.
 - The long flags can be shortened as long as the prefix is unambiguous (argparse behavior).
 
 ## Output formats
@@ -310,6 +317,76 @@ python3 jdk_versions.py --ea --fields version build url --json
   Values keep their native types, so `lts` is a boolean.
 - Filters and `--count` still apply to fields that are not displayed.
 
+## Downloading files
+
+`--download` saves every result in the listing to the directory named by `--target-directory`.
+What gets downloaded is exactly what would be listed, so `--lts`, `--os`, `--arch`, `--auto` and
+`--count` choose the files.
+
+```
+python3 jdk_versions.py --auto --lts --count 1 --download --target-directory ~/jdks
+python3 jdk_versions.py --lts --os linux --arch x64 --download --target-directory jdks
+python3 jdk_versions.py --ea --os windows --arch x64 --download --target-directory ea
+```
+
+- The listing still prints on stdout in the format you chose, so `--json` and `--csv` output stays
+  valid. Progress and the final count go to **stderr**. On a terminal each file gets a progress
+  bar (see [Colors and the progress bar](#colors-and-the-progress-bar)); otherwise you get one
+  `downloading <name>` line per file.
+- Each file is checked against its published SHA-256 checksum. The data is written to a `.part`
+  file first and renamed only when the checksum matches, so a failed download never leaves a file
+  under the real name.
+- Files keep the name from their download link. An existing file with that name is replaced.
+- A failed file does not stop the others. The script then exits with code 1 and prints one JSON
+  error per failed file on stderr.
+- Downloads use HTTPS only, with a 20 second timeout on each connection and no retries. The files
+  are large, often 100 MB or more, so check how many rows you are asking for. `--count` limits
+  them.
+- `--download` requires `--target-directory`, and the reverse. Without `--download`, nothing is
+  written to disk.
+
+## Colors and the progress bar
+
+On a terminal, the table is colored and downloads show a progress bar:
+
+```
+OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz [##########----------]  51% 69.0 MiB/134.8 MiB 7.6 MiB/s
+```
+
+The bar shows the file name, the share done, the bytes done and total, and the average speed. It
+redraws on one line and is replaced by the final state when the file finishes. A long file name is
+shortened to fit the window. If the server does not announce the file size, the bar and percentage
+are left out and you see the bytes done and the speed.
+
+**Colors.** The table borders are dimmed, the header is bold cyan, `version` is bold, `lts` is green
+for `true` and yellow for `false`, and the `url` and `sha256_url` columns are blue. Only the
+default table is colored. CSV and JSON never are.
+
+**Turning them off.** Use `--plain` to turn off both the colors and the progress bar. With
+`--plain` the output is the same text without the escape codes, and a download prints one
+`downloading <name>` line per file instead of a bar. They also turn off by themselves:
+
+| Situation | Colors | Progress bar |
+|---|---|---|
+| Output goes to a terminal | On | On |
+| `--plain` | Off | Off |
+| stdout is redirected or piped | Off | Unaffected (it follows stderr) |
+| stderr is redirected or piped | Unaffected (they follow stdout) | Off |
+| The `NO_COLOR` environment variable is set to anything but empty | Off | Unaffected |
+| `TERM=dumb` | Off | Off |
+
+The colors follow stdout and the progress bar follows stderr, so this writes a plain list to the
+file and still shows the bar on the terminal:
+
+```
+python3 jdk_versions.py --lts --download --target-directory jdks > list.txt
+```
+
+`NO_COLOR` is the [no-color.org](https://no-color.org) convention.
+
+On Windows, colors are used only in terminals that understand escape codes (Windows Terminal, VS
+Code and similar). In older consoles use `--plain`.
+
 ## How filtering and `--count` work
 
 1. **Release selection** (`--all`, `--lts`, `--non-lts`) picks the major versions.
@@ -363,8 +440,8 @@ error. Pass `--os` and `--arch` yourself in that case.
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, or the jdk.java.net page layout changed. |
-| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count` or an unknown `--fields` name. |
+| `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, the jdk.java.net page layout changed, or a `--download` failed (an unusable target directory, a network error or a checksum mismatch). |
+| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name or `--download` without `--target-directory`. |
 
 Runtime failures print a JSON object on **stderr**, and nothing on stdout:
 

@@ -12,6 +12,7 @@ Usage:
     python3 jdk_versions.py --arch x64                        # only x64 downloads (works with all modes)
     python3 jdk_versions.py --auto                            # only downloads for this machine's OS and architecture
     python3 jdk_versions.py --auto --lts --count 1            # newest LTS download for this machine
+    python3 jdk_versions.py --auto --lts --download --target-directory jdks   # download the listed files
     python3 jdk_versions.py --count 3                         # only the first 3 rows (works with all modes)
     python3 jdk_versions.py --csv                             # CSV output (works with all modes)
     python3 jdk_versions.py --ea                              # most recent early-access build
@@ -27,20 +28,27 @@ Usage:
     python3 jdk_versions.py --non-lts                         # only the latest non-LTS feature release
     python3 jdk_versions.py --non-lts --version-only          # just the major version, e.g. 27
     python3 jdk_versions.py --os linux                        # only linux downloads (works with all modes)
+    python3 jdk_versions.py --plain                           # no colors and no download progress bar
 """
 import argparse
 import csv
+import hashlib
 import http.client
 import json
 import os
 import platform
 import re
 import sys
+import time
+import urllib.parse
 import urllib.request
 
 API = "https://api.adoptium.net/v3"
 EA_SITE = "https://jdk.java.net"
 TIMEOUT = 20
+CHUNK_SIZE = 1024 * 1024
+BAR_WIDTH = 20
+BAR_INTERVAL = 0.1  # seconds between redraws of the progress bar
 
 # Everything that can go wrong while talking to the network. OSError covers URLError, HTTPError,
 # timeouts, connection resets/refusals, broken pipes and TLS failures; HTTPException covers
@@ -189,26 +197,71 @@ def cell(value):
     return str(value)
 
 
-def format_table(columns, rows, header=True, keep_sha256=False):
+BOLD, DIM, GREEN, YELLOW, BLUE, CYAN = "1", "2", "32", "33", "34", "36"
+
+
+def style(text, *codes):
+    """Wrap text in ANSI escape codes (no-op without codes)."""
+    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m" if codes else text
+
+
+def is_interactive(stream):
+    """True if stream is a real terminal that can redraw a line (not a pipe, file or dumb tty)."""
+    isatty = getattr(stream, "isatty", None)
+    return bool(isatty and isatty()) and os.environ.get("TERM") != "dumb"
+
+
+def use_color(stream):
+    """True if ANSI colors should be written to stream: a capable terminal and NO_COLOR unset.
+
+    On Windows, where older consoles print escape codes literally, colors are used only in
+    terminals known to support them (Windows Terminal, VS Code and similar).
+    """
+    if os.environ.get("NO_COLOR") or not is_interactive(stream):
+        return False
+    if sys.platform == "win32":
+        return any(os.environ.get(v) for v in ("WT_SESSION", "TERM_PROGRAM", "ANSICON"))
+    return True
+
+
+def cell_codes(column, value):
+    """The ANSI codes for one table cell, chosen by its column and value."""
+    if column == "lts":
+        return (GREEN,) if value == "true" else (YELLOW,)
+    if column == "version":
+        return (BOLD,)
+    if column in ("url", "sha256_url"):
+        return (BLUE,)
+    return ()
+
+
+def format_table(columns, rows, header=True, keep_sha256=False, color=False):
     """Render rows as a plain-text table.
 
     The sha256_url column is left out by default to keep the table readable; keep_sha256=True
     includes it. With header=False the column names and the rule beneath them are left out.
+    color=True adds ANSI colors; padding is applied before coloring so columns stay aligned.
     """
     if not keep_sha256:
         columns = [c for c in columns if c != "sha256_url"]
     cells = [[cell(row.get(c)) for c in columns] for row in rows]
     widths = [max([len(c)] + [len(r[i]) for r in cells]) for i, c in enumerate(columns)]
-    border = "+-" + "-+-".join("-" * w for w in widths) + "-+"
 
-    def line(values):
-        return "| " + " | ".join(v.ljust(w) for v, w in zip(values, widths)) + " |"
+    def paint(text, *codes):
+        return style(text, *codes) if color else text
 
-    head = [line(columns), border] if header else []
-    return "\n".join([border, *head, *(line(r) for r in cells), border])
+    border = paint("+-" + "-+-".join("-" * w for w in widths) + "-+", DIM)
+    bar = paint("|", DIM)
+
+    def line(values, codes_for):
+        parts = [paint(v.ljust(w), *codes_for(c, v)) for c, v, w in zip(columns, values, widths)]
+        return f"{bar} " + f" {bar} ".join(parts) + f" {bar}"
+
+    head = [line(columns, lambda c, v: (BOLD, CYAN)), border] if header else []
+    return "\n".join([border, *head, *(line(r, cell_codes) for r in cells), border])
 
 
-def emit(payload, fmt, columns, rows, header=True, fields=None):
+def emit(payload, fmt, columns, rows, header=True, fields=None, color=False):
     """Write the result to stdout as a table, indented JSON, or CSV.
 
     header=False drops the header row from the table and CSV output; JSON is unaffected.
@@ -216,6 +269,8 @@ def emit(payload, fmt, columns, rows, header=True, fields=None):
     fields, if given, is the list of columns to output, in that order. Table and CSV show just
     those columns (the table includes sha256_url if it is asked for). JSON becomes the usual
     source/arch/os envelope plus a flat "rows" list of objects holding only those fields.
+
+    color=True colors the table. CSV and JSON are never colored.
     """
     if fields:
         columns = fields
@@ -229,7 +284,7 @@ def emit(payload, fmt, columns, rows, header=True, fields=None):
     elif fmt == "json":
         print(json.dumps(payload, indent=2))
     else:
-        print(format_table(columns, rows, header, keep_sha256=bool(fields)))
+        print(format_table(columns, rows, header, keep_sha256=bool(fields), color=color))
 
 
 def emit_versions(source, arch, os_name, majors, fmt, header=True):
@@ -260,6 +315,188 @@ def fetch(url, accept):
 
 def get_json(path):
     return json.loads(fetch(f"{API}{path}", "application/json"))
+
+
+def filename_from_url(url):
+    """Return the file name to save a download as, or raise ValueError if the URL is unsafe."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https":
+        raise ValueError("refusing to download over anything but HTTPS")
+    name = urllib.parse.unquote(parsed.path).rsplit("/", 1)[-1]
+    if name in ("", ".", "..") or any(c in name for c in '\\:\0'):
+        raise ValueError(f"cannot make a safe file name from '{name}'")
+    return name
+
+
+def parse_sha256(text):
+    """Return the SHA-256 hex digest from a checksum file ('<digest>' or '<digest>  <name>')."""
+    words = text.split()
+    digest = words[0].lower() if words else ""
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("the checksum file does not hold a SHA-256 digest")
+    return digest
+
+
+def format_size(num):
+    """Format a byte count for people, in binary units: 512 B, 3.4 KiB, 141.3 MiB, 1.2 GiB."""
+    num = float(num)
+    for unit in ("B", "KiB", "MiB"):
+        if num < 1024:
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} GiB"
+
+
+def content_length(resp):
+    """The size announced by a response's Content-Length header, or None if unknown."""
+    headers = getattr(resp, "headers", None)
+    try:
+        value = int(headers.get("Content-Length")) if headers is not None else None
+    except (TypeError, ValueError):
+        return None
+    return value if value and value > 0 else None
+
+
+def terminal_width(stream, default=80):
+    """The stream's terminal width, or default if it can't be found or is reported as 0."""
+    try:
+        return os.get_terminal_size(stream.fileno()).columns or default
+    except (OSError, ValueError, AttributeError):
+        return default
+
+
+class ProgressBar:
+    """A one-line download progress bar that redraws itself in place on a terminal.
+
+    Shows the file name, a bar, the percentage, bytes done/total and the average speed. If the
+    total size is unknown the bar and percentage are left out. Redraws are limited to one every
+    BAR_INTERVAL seconds so a fast download doesn't flood the terminal.
+    """
+
+    def __init__(self, name, total, stream=None, color=False, width=None, clock=time.monotonic):
+        self.name, self.total = name, total
+        self.stream = stream if stream is not None else sys.stderr
+        self.color = color
+        self.width = width or terminal_width(self.stream)
+        self.clock = clock
+        self.start = self.last_draw = clock()
+        self.done = 0
+        self.drawn = 0  # width of the last line drawn, so a shorter one can blank out the rest
+
+    def line(self):
+        """Return (text, visible_length) for the current state; text has escapes only if color."""
+        elapsed = max(self.clock() - self.start, 1e-9)
+        rate = f"{format_size(self.done / elapsed)}/s"
+        size = format_size(self.done)
+        if self.total:
+            frac = min(self.done / self.total, 1.0)
+            filled = int(BAR_WIDTH * frac)
+            size = f"{size}/{format_size(self.total)}"
+            tail = [(" [", ()), ("#" * filled, (GREEN,)), ("-" * (BAR_WIDTH - filled), (DIM,)),
+                    ("] ", ()), (f"{int(frac * 100):3d}%", (BOLD,)), (f" {size} {rate}", ())]
+        else:
+            tail = [(f"  {size} {rate}", ())]
+        room = max(self.width - 1 - sum(len(t) for t, _ in tail), 8)
+        name = self.name if len(self.name) <= room else self.name[:room - 3] + "..."
+        parts = [(name, (BOLD,))] + tail
+        plain = "".join(t for t, _ in parts)
+        text = "".join(style(t, *c) if self.color else t for t, c in parts)
+        return text, len(plain)
+
+    def draw(self, end=""):
+        text, length = self.line()
+        padding = " " * max(self.drawn - length, 0)
+        self.stream.write(f"\r{text}{padding}{end}")
+        self.stream.flush()
+        self.drawn = length
+
+    def update(self, done):
+        self.done = done
+        now = self.clock()
+        if now - self.last_draw >= BAR_INTERVAL:
+            self.last_draw = now
+            self.draw()
+
+    def finish(self):
+        """Draw the final state and move to the next line."""
+        self.draw(end="\n")
+
+    def abort(self):
+        """Erase the bar so an error message can take its place."""
+        if self.drawn:
+            self.stream.write("\r" + " " * self.drawn + "\r")
+            self.stream.flush()
+
+
+def download_verified(url, sha256_url, dest, make_progress=None):
+    """Download url to dest, keeping it only if it matches the published SHA-256 checksum.
+
+    The data goes to dest + '.part' first, so a failed or corrupt download never leaves a file
+    under the final name. make_progress, if given, is called with the total size (or None) once
+    the download starts and must return an object with update(done), finish() and abort().
+    """
+    expected = parse_sha256(fetch(sha256_url, "text/plain"))
+    part = dest + ".part"
+    digest = hashlib.sha256()
+    req = urllib.request.Request(url, headers={"User-Agent": "jdk-versions/1.0"})
+    bar = None
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp, open(part, "wb") as out:
+            if make_progress:
+                bar = make_progress(content_length(resp))
+            done = 0
+            while chunk := resp.read(CHUNK_SIZE):
+                digest.update(chunk)
+                out.write(chunk)
+                done += len(chunk)
+                if bar:
+                    bar.update(done)
+        if digest.hexdigest() != expected:
+            raise ValueError("checksum mismatch")
+        os.replace(part, dest)
+        if bar:
+            bar.finish()
+    except BaseException:
+        if bar:
+            bar.abort()
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise
+
+
+def download_all(rows, directory, show_bar=False):
+    """Download every row's url into directory, reporting progress on stderr.
+
+    With show_bar a progress bar is drawn for each file; otherwise one "downloading <name>" line
+    is printed per file. Returns the exit code: 0 if every file downloaded and verified,
+    otherwise 1. A failed file does not stop the rest.
+    """
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        print(json.dumps({"error": f"cannot use target directory '{directory}': {exc}"}),
+              file=sys.stderr)
+        return 1
+    failures = 0
+    for row in rows:
+        try:
+            name = filename_from_url(row["url"])
+            make_progress = None
+            if show_bar:
+                def make_progress(total, name=name):
+                    return ProgressBar(name, total, color=use_color(sys.stderr))
+            else:
+                print(f"downloading {name}", file=sys.stderr)
+            download_verified(row["url"], row["sha256_url"], os.path.join(directory, name),
+                              make_progress)
+        except (*NETWORK_ERRORS, ValueError) as exc:
+            print(json.dumps({"error": f"failed to download {row['url']}: {exc}"}), file=sys.stderr)
+            failures += 1
+    print(f"downloaded {len(rows) - failures} of {len(rows)} file(s) to {directory}",
+          file=sys.stderr)
+    return 1 if failures else 0
 
 
 def latest_early_access():
@@ -384,6 +621,21 @@ def main():
              "JSON output becomes a flat 'rows' list. Not available with --version-only",
     )
     parser.add_argument(
+        "--download", action="store_true",
+        help="download every listed result (after --os, --arch, --count and the other filters) "
+             "into --target-directory, checking each against its SHA-256 checksum. Progress goes "
+             "to stderr. Not available with --list-arch, --list-os or --version-only",
+    )
+    parser.add_argument(
+        "--target-directory", metavar="DIR",
+        help="the directory --download saves files in (created if it does not exist)",
+    )
+    parser.add_argument(
+        "--plain", action="store_true",
+        help="no colors in the table and no download progress bar (both are also off when the "
+             "output is not a terminal; colors are off when NO_COLOR is set)",
+    )
+    parser.add_argument(
         "--auto", action="store_true",
         help="detect this machine's OS and architecture and filter for them. An explicit "
              "--os or --arch takes precedence over the detected value",
@@ -393,6 +645,13 @@ def main():
         parser.error("argument --version-only: not allowed with --list-arch or --list-os")
     if args.auto and (args.list_arch or args.list_os):
         parser.error("argument --auto: not allowed with --list-arch or --list-os")
+    if args.download and args.target_directory is None:
+        parser.error("argument --download: requires --target-directory")
+    if args.target_directory is not None and not args.download:
+        parser.error("argument --target-directory: requires --download")
+    if args.download and (args.list_arch or args.list_os or args.version_only):
+        parser.error("argument --download: not allowed with --list-arch, --list-os or "
+                     "--version-only")
     fields = None
     if args.fields:
         if args.version_only:
@@ -414,6 +673,8 @@ def main():
         args.arch = args.arch or detected_arch
     output_format = "csv" if args.csv else "json" if args.json else "table"
     header = not args.no_header
+    color = not args.plain and use_color(sys.stdout)
+    show_bar = not args.plain and is_interactive(sys.stderr)
 
     if args.list_arch:
         try:
@@ -426,7 +687,7 @@ def main():
             "arch": args.arch,
             "os": args.os_name,
             "architectures": archs,
-        }, output_format, ["arch"], [{"arch": a} for a in archs], header, fields)
+        }, output_format, ["arch"], [{"arch": a} for a in archs], header, fields, color)
         return 0
 
     if args.list_os:
@@ -440,7 +701,7 @@ def main():
             "arch": args.arch,
             "os": args.os_name,
             "operating_systems": oses,
-        }, output_format, ["os"], [{"os": o} for o in oses], header, fields)
+        }, output_format, ["os"], [{"os": o} for o in oses], header, fields, color)
         return 0
 
     if args.early_access:
@@ -461,16 +722,15 @@ def main():
                           [ea["major"]], output_format, header)
             return 0
         ea["downloads"] = limit_downloads(ea["downloads"], args.count)
+        rows = download_rows(ea["downloads"], major=ea["major"], version=ea["version"],
+                             build=ea["build"], released=ea["released"])
         emit({
             "source": "jdk.java.net (Oracle-led OpenJDK)",
             "arch": args.arch,
             "os": args.os_name,
             "early_access": ea,
-        }, output_format, EA_COLUMNS,
-            download_rows(ea["downloads"], major=ea["major"], version=ea["version"],
-                          build=ea["build"], released=ea["released"]),
-            header, fields)
-        return 0
+        }, output_format, EA_COLUMNS, rows, header, fields, color)
+        return download_all(rows, args.target_directory, show_bar) if args.download else 0
 
     try:
         info = get_json("/info/available_releases")
@@ -524,8 +784,8 @@ def main():
             lts=r["lts"], released=r["released"],
         )
     ]
-    emit(result, output_format, RELEASE_COLUMNS, rows, header, fields)
-    return 0
+    emit(result, output_format, RELEASE_COLUMNS, rows, header, fields, color)
+    return download_all(rows, args.target_directory, show_bar) if args.download else 0
 
 
 if __name__ == "__main__":
