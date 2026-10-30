@@ -48,7 +48,8 @@ jobs:
 
       # --auto picks this runner's OS and architecture. --install implies --download (fetches and
       # verifies the archive against its published SHA-256 checksum) and then unpacks it into
-      # --prefix-dir. The installed path printed to stderr is captured and used to set JAVA_HOME.
+      # --prefix-dir/<install-prefix><major>. We resolve the install path from the major version
+      # returned by --version-only so we never have to parse stderr output.
       - name: Download, verify and install the latest non-LTS JDK for this machine
         run: |
           set -euo pipefail
@@ -58,11 +59,11 @@ jobs:
             DOWNLOAD_DIR=$(cygpath -m "$RUNNER_TEMP")/jdk-download
             PREFIX_DIR=$(cygpath -m "$RUNNER_TEMP")/jdk-install
           fi
-          INSTALL_OUT=$(python jdk_versions.py --auto --non-lts --count 1 \
+          MAJOR=$(python jdk_versions.py --auto --non-lts --version-only)
+          python jdk_versions.py --auto --non-lts --count 1 \
             --install --target-directory "$DOWNLOAD_DIR" \
-            --prefix-dir "$PREFIX_DIR" --install-prefix jdk \
-            2>&1 | tee /dev/stderr | grep '^installed ' | sed 's/^installed //')
-          JAVA_HOME_DIR=$(cd "$INSTALL_OUT" && pwd)
+            --prefix-dir "$PREFIX_DIR" --install-prefix jdk
+          JAVA_HOME_DIR=$(cd "$PREFIX_DIR/jdk$MAJOR" && pwd)
           if command -v cygpath >/dev/null; then JAVA_HOME_DIR=$(cygpath -w "$JAVA_HOME_DIR"); fi
           echo "JAVA_HOME=$JAVA_HOME_DIR" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_DIR/bin" >> "$GITHUB_PATH"
