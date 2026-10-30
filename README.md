@@ -1,5 +1,10 @@
 # jdk_versions.py
 
+[![CI](https://github.com/luck3y/pyjdkutils/actions/workflows/ci.yml/badge.svg)](https://github.com/luck3y/pyjdkutils/actions/workflows/ci.yml)
+[![Install JDK](https://github.com/luck3y/pyjdkutils/actions/workflows/install-jdk.yml/badge.svg)](https://github.com/luck3y/pyjdkutils/actions/workflows/install-jdk.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![License: BSD 2-Clause](https://img.shields.io/badge/license-BSD%202--Clause-blue)](LICENSE)
+
 A command-line tool that reports the most recent released JDK versions, with download links, as a
 table, JSON or CSV.
 
