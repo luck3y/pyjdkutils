@@ -493,8 +493,15 @@ up to date.
 A second workflow, [`.github/workflows/install-jdk.yml`](.github/workflows/install-jdk.yml), uses
 the script to install the latest non-LTS JDK on the runner. `--auto` picks the runner's OS and
 architecture, so it works unchanged on Linux x64, Linux ARM64, macOS (Apple Silicon) and Windows
-x64. It downloads the archive, checks its SHA-256 checksum, sets `JAVA_HOME` and `PATH`, and runs
-`java -version`. It is also a worked example of using the script in a pipeline.
+x64. A single command does the lookup and the download, and `--download` checks the archive against
+its SHA-256 checksum:
+
+```
+python jdk_versions.py --auto --non-lts --count 1 --download --target-directory "$DOWNLOAD_DIR"
+```
+
+The workflow then unpacks the archive, sets `JAVA_HOME` and `PATH`, and runs `java -version`. It is
+also a worked example of using the script in a pipeline.
 
 ## Author
 

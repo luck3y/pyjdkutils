@@ -1,7 +1,8 @@
 name: Install latest non-LTS JDK
 
 # Installs the newest non-LTS Temurin JDK that matches the runner's own OS and architecture, using
-# this repository's jdk_versions.py (--auto detects the host), then checks that it runs.
+# this repository's jdk_versions.py (--auto detects the host, --download fetches and verifies the
+# archive), then checks that it runs.
 
 on:
   push:
@@ -45,55 +46,30 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Find the latest non-LTS JDK for this machine
+      # --auto picks this runner's OS and architecture. --download saves the file and checks it
+      # against its published SHA-256 checksum, and the step fails if the download or the check
+      # fails. The directory starts empty, so the one file in it afterwards is the archive.
+      - name: Download and verify the latest non-LTS JDK for this machine
         run: |
           set -euo pipefail
-          # --auto picks this runner's OS and architecture. The CSV has no header and one row.
-          IFS=, read -r JDK_URL JDK_SHA_URL < <(
-            python jdk_versions.py --auto --non-lts --count 1 --csv --no-header --fields url,sha256_url
-          )
-          JDK_URL=${JDK_URL%$'\r'}
-          JDK_SHA_URL=${JDK_SHA_URL%$'\r'}
-          case "$JDK_URL" in
-            https://github.com/adoptium/*) ;;
-            *) echo "unexpected download URL: $JDK_URL" >&2; exit 1 ;;
-          esac
-          echo "JDK_URL=$JDK_URL" >> "$GITHUB_ENV"
-          echo "JDK_SHA_URL=$JDK_SHA_URL" >> "$GITHUB_ENV"
-          echo "Selected: $JDK_URL"
-
-      - name: Download and verify the JDK
-        run: |
-          set -euo pipefail
-          TMP=$RUNNER_TEMP
-          if command -v cygpath >/dev/null; then TMP=$(cygpath -u "$RUNNER_TEMP"); fi
-          mkdir -p "$TMP/jdk-download"
-          cd "$TMP/jdk-download"
-          case "$JDK_URL" in
-            *.zip) ARCHIVE=jdk.zip ;;
-            *)     ARCHIVE=jdk.tar.gz ;;
-          esac
-          curl --fail --silent --show-error --location --retry 3 -o "$ARCHIVE" "$JDK_URL"
-          curl --fail --silent --show-error --location --retry 3 -o jdk.sha256 "$JDK_SHA_URL"
-          EXPECTED=$(head -n 1 jdk.sha256 | cut -d' ' -f1 | tr -d '\r' | tr 'A-F' 'a-f')
-          ACTUAL=$(python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$ARCHIVE")
-          echo "expected: $EXPECTED"
-          echo "actual:   $ACTUAL"
-          [ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || { echo "checksum mismatch" >&2; exit 1; }
-          ARCHIVE_PATH=$PWD/$ARCHIVE
-          if command -v cygpath >/dev/null; then ARCHIVE_PATH=$(cygpath -m "$ARCHIVE_PATH"); fi
-          echo "ARCHIVE=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+          DOWNLOAD_DIR="$RUNNER_TEMP/jdk-download"
+          if command -v cygpath >/dev/null; then DOWNLOAD_DIR=$(cygpath -m "$RUNNER_TEMP")/jdk-download; fi
+          python jdk_versions.py --auto --non-lts --count 1 --download --target-directory "$DOWNLOAD_DIR"
+          set -- "$DOWNLOAD_DIR"/*
+          [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "expected exactly one downloaded file in $DOWNLOAD_DIR" >&2; exit 1; }
+          echo "ARCHIVE=$1" >> "$GITHUB_ENV"
+          echo "Downloaded $1"
 
       - name: Install the JDK
         run: |
           set -euo pipefail
-          TMP=$RUNNER_TEMP
-          if command -v cygpath >/dev/null; then TMP=$(cygpath -u "$RUNNER_TEMP"); fi
-          DEST="$TMP/jdk"
+          DEST="$RUNNER_TEMP/jdk"
+          if command -v cygpath >/dev/null; then DEST=$(cygpath -m "$RUNNER_TEMP")/jdk; fi
           mkdir -p "$DEST"
           case "$ARCHIVE" in
             *.zip)    python -m zipfile -e "$ARCHIVE" "$DEST" ;;
             *.tar.gz) tar -xzf "$ARCHIVE" -C "$DEST" ;;
+            *) echo "unexpected archive type: $ARCHIVE" >&2; exit 1 ;;
           esac
           # The archive holds one directory. On macOS the JDK is in Contents/Home inside it.
           TOP=$(echo "$DEST"/*/)
