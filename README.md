@@ -408,6 +408,11 @@ The tests are in [`test_jdk_versions.py`](test_jdk_versions.py). They use no net
 network layer is replaced with canned responses. They cover every option, the output formats,
 platform detection, the early-access scraper, invalid combinations and network failures.
 
+GitHub Actions runs them on every push to `main` and on every pull request, on Python 3.11 to 3.15
+on Linux, plus Python 3.14 on macOS and Windows. See
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). Dependabot keeps the pinned action versions
+up to date.
+
 ## Author
 
 Ken Wills &lt;ken@zaptillion.net&gt;
