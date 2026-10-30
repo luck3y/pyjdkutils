@@ -84,8 +84,9 @@ def fake_fetch(url, accept):
     if url.endswith((".sha256.txt", ".sha256")):
         data = payload_for(url.rsplit(".sha256", 1)[0])
         return hashlib.sha256(data).hexdigest() + "  " + url.rsplit("/", 1)[-1]
-    if url.startswith(j.API):
-        path = url[len(j.API):]
+    _api_base = j.SOURCES["temurin"][0]
+    if url.startswith(_api_base):
+        path = url[len(_api_base):]
         if path == "/info/available_releases":
             return json.dumps(AVAILABLE)
         if path == "/types/architectures":
@@ -2460,7 +2461,8 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(urlopen.call_args.kwargs["timeout"], j.TIMEOUT)
 
     def test_urls_use_https(self):
-        self.assertTrue(j.API.startswith("https://"))
+        for name, (api_base, _, _) in j.SOURCES.items():
+            self.assertTrue(api_base.startswith("https://"), f"{name} API base must use HTTPS")
         self.assertTrue(j.EA_SITE.startswith("https://"))
 
 

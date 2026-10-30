@@ -12,7 +12,8 @@ Python standard library.
 **What it can do:**
 
 - **List** the latest GA and early-access JDK releases as a table, JSON or CSV, filtered by
-  version, OS, architecture or major version.
+  version, OS, architecture or major version. Switch between distributions with `--source`
+  (e.g. `--source semeru` for IBM Semeru).
 - **Download** any listed release into a directory of your choice, verifying each file against its
   published SHA-256 checksum. Already-downloaded files that are still current are skipped
   automatically; use `--force` to re-download regardless.
@@ -28,9 +29,12 @@ Python standard library.
 
 **Data sources:**
 
-- **GA releases:** [Adoptium API](https://api.adoptium.net) — Eclipse Temurin builds for Linux,
-  macOS, Windows, AIX and more, across x64, aarch64 and other architectures.
-- **Early-access builds:** [jdk.java.net](https://jdk.java.net) — the Oracle-led OpenJDK
+- **GA releases (default — `--source temurin`):** [Adoptium API](https://api.adoptium.net) —
+  Eclipse Temurin builds for Linux, macOS, Windows, AIX and more, across x64, aarch64 and other
+  architectures.
+- **GA releases (`--source semeru`):** [AdoptOpenJDK API](https://api.adoptopenjdk.net) — IBM
+  Semeru (OpenJ9-based) builds. Use `--source ibm` as an alias.
+- **Early-access builds (`--ea`):** [jdk.java.net](https://jdk.java.net) — the Oracle-led OpenJDK
   early-access builds for the next major version, before it reaches GA.
 
 Requires Python 3.11 or later. Uses only the standard library — nothing to install.
@@ -190,7 +194,8 @@ python3 jdk_versions.py --ea --version-only          # 28
 | Option | What it does |
 |---|---|
 | *(none)* | Prints the LTS releases plus the latest feature release, as a table. |
-| `--all` | Includes every major release Adoptium publishes, not only the LTS releases and the latest feature release. |
+| `--source SOURCE` | The JDK distribution to query for GA releases: `temurin` (default, Eclipse Temurin via Adoptium API) or `semeru` (IBM Semeru via AdoptOpenJDK API). Aliases: `ibm`, `eclipse`, `openj9`. Not available with `--ea`. |
+| `--all` | Includes every major release the chosen source publishes, not only the LTS releases and the latest feature release. |
 | `--lts` | Returns only LTS releases. |
 | `--non-lts` | Returns only non-LTS releases. Without `--all` that is just the latest feature release. |
 | `--ea` | Returns only the most recent early-access build, from jdk.java.net. |
@@ -219,6 +224,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 Rules for combining options:
 
 - `--lts`, `--non-lts`, `--ea`, `--list-arch` and `--list-os` are mutually exclusive.
+- `--source` selects the GA distribution and can be combined with all GA modes. It is not available with `--ea`, which always uses jdk.java.net.
 - `--major` can be combined with any mode. With `--lts` or `--non-lts` it further narrows the result; an error is returned if the requested version is not available or does not match the LTS/non-LTS filter.
 - `--json` and `--csv` are mutually exclusive.
 - `--auto` and `--version-only` cannot be used with `--list-arch` or `--list-os`.

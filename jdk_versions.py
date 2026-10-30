@@ -9,6 +9,8 @@ Usage:
     python3 jdk_versions.py                                                    # LTS releases + latest feature release, as a table
     python3 jdk_versions.py --major 21                                         # only JDK 21 (all platforms)
     python3 jdk_versions.py --major 21 --auto                                  # only JDK 21 for this machine
+    python3 jdk_versions.py --source semeru --auto --lts                       # LTS Semeru (IBM) builds for this machine
+    python3 jdk_versions.py --source semeru --auto --lts --install --prefix-dir /java --install-prefix jdk   # download + install
     python3 jdk_versions.py --all                                              # every available major release
     python3 jdk_versions.py --all --non-lts                                    # every non-LTS major release
     python3 jdk_versions.py --arch x64                                         # only x64 downloads (works with all modes)
@@ -54,7 +56,17 @@ import urllib.request
 import zipfile
 import zlib
 
-API = "https://api.adoptium.net/v3"
+# Known GA sources: name -> (api_base, jvm_impl, human_label)
+# The Adoptium API (api.adoptium.net) only serves Temurin/hotspot builds.
+# Other distributions (e.g. IBM Semeru) are served by the legacy AdoptOpenJDK API
+# (api.adoptopenjdk.net) with different vendor/jvm_impl query parameters.
+SOURCES = {
+    "temurin": ("https://api.adoptium.net/v3",    "hotspot",  "Eclipse Temurin (Adoptium API)"),
+    "semeru":  ("https://api.adoptopenjdk.net/v3", "openj9",   "IBM Semeru (AdoptOpenJDK API)"),
+}
+# Aliases that map to canonical source names.
+SOURCE_ALIASES = {"ibm": "semeru", "openj9": "semeru", "eclipse": "temurin"}
+
 EA_SITE = "https://jdk.java.net"
 TIMEOUT = 20
 CHUNK_SIZE = 1024 * 1024
@@ -360,8 +372,9 @@ def fetch(url, accept):
         return resp.read().decode("utf-8")
 
 
-def get_json(path):
-    return json.loads(fetch(f"{API}{path}", "application/json"))
+def get_json(path, api=None):
+    base = api if api is not None else SOURCES["temurin"][0]
+    return json.loads(fetch(f"{base}{path}", "application/json"))
 
 
 def filename_from_url(url):
@@ -749,9 +762,10 @@ def latest_early_access():
     }
 
 
-def latest_for_major(major, lts_majors):
-    """Return details and download links of the latest GA Temurin JDK for a major version."""
-    assets = get_json(f"/assets/latest/{major}/hotspot?image_type=jdk")
+def latest_for_major(major, lts_majors, api=None, jvm_impl="hotspot"):
+    """Return details and download links of the latest GA JDK for a major version."""
+    vendor_param = "" if jvm_impl == "hotspot" else "&vendor=ibm"
+    assets = get_json(f"/assets/latest/{major}/{jvm_impl}?image_type=jdk{vendor_param}", api=api)
     if not assets:
         return None
 
@@ -964,11 +978,28 @@ def main():
         help="detect this machine's OS and architecture and filter for them. An explicit "
              "--os or --arch takes precedence over the detected value",
     )
+    source_names = ", ".join(SOURCES)
+    source_aliases = ", ".join(f"{k} -> {v}" for k, v in SOURCE_ALIASES.items())
+    parser.add_argument(
+        "--source", metavar="SOURCE", default="temurin",
+        help=f"the JDK distribution to query for GA releases: {source_names} "
+             f"(aliases: {source_aliases}). Defaults to temurin. "
+             "Not available with --ea (which always uses jdk.java.net)",
+    )
     args = parser.parse_args()
     if args.version_only and (args.list_arch or args.list_os):
         parser.error("argument --version-only: not allowed with --list-arch or --list-os")
     if args.auto and (args.list_arch or args.list_os):
         parser.error("argument --auto: not allowed with --list-arch or --list-os")
+    # Normalise and validate --source
+    source_key = SOURCE_ALIASES.get(args.source.strip().lower(), args.source.strip().lower())
+    if source_key not in SOURCES:
+        parser.error(f"argument --source: unknown source '{args.source}' "
+                     f"(known: {source_names}; aliases: {source_aliases})")
+    if args.early_access and source_key != "temurin":
+        parser.error("argument --source: not available with --ea "
+                     "(early-access builds always come from jdk.java.net)")
+    api_base, jvm_impl, source_label = SOURCES[source_key]
     if args.install and not args.download:
         args.download = True
     if args.target_directory != "." and not args.download:
@@ -1011,12 +1042,12 @@ def main():
 
     if args.list_arch:
         try:
-            archs = get_json("/types/architectures")[:args.count]
+            archs = get_json("/types/architectures", api=api_base)[:args.count]
         except (*NETWORK_ERRORS, ValueError) as exc:
             print(json.dumps({"error": f"failed to fetch architectures: {exc}"}), file=sys.stderr)
             return 1
         emit({
-            "source": "Eclipse Temurin (Adoptium API)",
+            "source": source_label,
             "arch": args.arch,
             "os": args.os_name,
             "architectures": archs,
@@ -1025,12 +1056,12 @@ def main():
 
     if args.list_os:
         try:
-            oses = [OS_ALIASES.get(o, o) for o in get_json("/types/operating_systems")][:args.count]
+            oses = [OS_ALIASES.get(o, o) for o in get_json("/types/operating_systems", api=api_base)][:args.count]
         except (*NETWORK_ERRORS, ValueError) as exc:
             print(json.dumps({"error": f"failed to fetch operating systems: {exc}"}), file=sys.stderr)
             return 1
         emit({
-            "source": "Eclipse Temurin (Adoptium API)",
+            "source": source_label,
             "arch": args.arch,
             "os": args.os_name,
             "operating_systems": oses,
@@ -1072,7 +1103,7 @@ def main():
         return finish_downloads(rows, args, show_bar)
 
     try:
-        info = get_json("/info/available_releases")
+        info = get_json("/info/available_releases", api=api_base)
         lts = set(info["available_lts_releases"])
         if args.major is not None:
             if args.major not in info["available_releases"]:
@@ -1093,7 +1124,7 @@ def main():
 
         releases = []
         for major in sorted(majors, reverse=True):
-            entry = latest_for_major(major, lts)
+            entry = latest_for_major(major, lts, api=api_base, jvm_impl=jvm_impl)
             if entry and (args.arch or args.os_name):
                 entry["downloads"] = filter_downloads(entry["downloads"], args.arch, args.os_name)
                 if not entry["downloads"]:
@@ -1112,13 +1143,13 @@ def main():
         return 1
 
     if args.version_only:
-        emit_versions("Eclipse Temurin (Adoptium API)", args.arch, args.os_name,
+        emit_versions(source_label, args.arch, args.os_name,
                       [r["major"] for r in releases][:args.count], output_format, header)
         return 0
 
     releases = limit_releases(releases, args.count)
     result = {
-        "source": "Eclipse Temurin (Adoptium API)",
+        "source": source_label,
         "arch": args.arch,
         "os": args.os_name,
         "most_recent_feature_release": info["most_recent_feature_release"],
