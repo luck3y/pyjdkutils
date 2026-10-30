@@ -409,9 +409,15 @@ network layer is replaced with canned responses. They cover every option, the ou
 platform detection, the early-access scraper, invalid combinations and network failures.
 
 GitHub Actions runs them on every push to `main` and on every pull request, on Python 3.11 to 3.15
-on Linux, plus Python 3.14 on macOS and Windows. See
+on each of Linux, macOS (Apple Silicon) and Windows. See
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Dependabot keeps the pinned action versions
 up to date.
+
+A second workflow, [`.github/workflows/install-jdk.yml`](.github/workflows/install-jdk.yml), uses
+the script to install the latest non-LTS JDK on the runner. `--auto` picks the runner's OS and
+architecture, so it works unchanged on Linux x64, Linux ARM64, macOS (Apple Silicon) and Windows
+x64. It downloads the archive, checks its SHA-256 checksum, sets `JAVA_HOME` and `PATH`, and runs
+`java -version`. It is also a worked example of using the script in a pipeline.
 
 ## Author
 

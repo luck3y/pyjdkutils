@@ -1,0 +1,115 @@
+name: Install latest non-LTS JDK
+
+# Installs the newest non-LTS Temurin JDK that matches the runner's own OS and architecture, using
+# this repository's jdk_versions.py (--auto detects the host), then checks that it runs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-jdk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install-jdk:
+    name: Install JDK (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner for each OS and architecture that has a non-LTS Temurin build. The
+        # macos-15-intel and windows-11-arm runners are left out because Adoptium publishes no
+        # macOS x64 or Windows aarch64 build of the current non-LTS release.
+        runner:
+          - ubuntu-latest        # linux x64
+          - ubuntu-24.04-arm     # linux aarch64
+          - macos-latest         # macOS aarch64 (Apple Silicon)
+          - windows-latest       # windows x64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Actions are pinned to commit SHAs. Dependabot keeps them current (see dependabot.yml).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Find the latest non-LTS JDK for this machine
+        run: |
+          set -euo pipefail
+          # --auto picks this runner's OS and architecture. The CSV has no header and one row.
+          IFS=, read -r JDK_URL JDK_SHA_URL < <(
+            python jdk_versions.py --auto --non-lts --count 1 --csv --no-header --fields url,sha256_url
+          )
+          JDK_URL=${JDK_URL%$'\r'}
+          JDK_SHA_URL=${JDK_SHA_URL%$'\r'}
+          case "$JDK_URL" in
+            https://github.com/adoptium/*) ;;
+            *) echo "unexpected download URL: $JDK_URL" >&2; exit 1 ;;
+          esac
+          echo "JDK_URL=$JDK_URL" >> "$GITHUB_ENV"
+          echo "JDK_SHA_URL=$JDK_SHA_URL" >> "$GITHUB_ENV"
+          echo "Selected: $JDK_URL"
+
+      - name: Download and verify the JDK
+        run: |
+          set -euo pipefail
+          TMP=$RUNNER_TEMP
+          if command -v cygpath >/dev/null; then TMP=$(cygpath -u "$RUNNER_TEMP"); fi
+          mkdir -p "$TMP/jdk-download"
+          cd "$TMP/jdk-download"
+          case "$JDK_URL" in
+            *.zip) ARCHIVE=jdk.zip ;;
+            *)     ARCHIVE=jdk.tar.gz ;;
+          esac
+          curl --fail --silent --show-error --location --retry 3 -o "$ARCHIVE" "$JDK_URL"
+          curl --fail --silent --show-error --location --retry 3 -o jdk.sha256 "$JDK_SHA_URL"
+          EXPECTED=$(head -n 1 jdk.sha256 | cut -d' ' -f1 | tr -d '\r' | tr 'A-F' 'a-f')
+          ACTUAL=$(python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$ARCHIVE")
+          echo "expected: $EXPECTED"
+          echo "actual:   $ACTUAL"
+          [ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || { echo "checksum mismatch" >&2; exit 1; }
+          ARCHIVE_PATH=$PWD/$ARCHIVE
+          if command -v cygpath >/dev/null; then ARCHIVE_PATH=$(cygpath -m "$ARCHIVE_PATH"); fi
+          echo "ARCHIVE=$ARCHIVE_PATH" >> "$GITHUB_ENV"
+
+      - name: Install the JDK
+        run: |
+          set -euo pipefail
+          TMP=$RUNNER_TEMP
+          if command -v cygpath >/dev/null; then TMP=$(cygpath -u "$RUNNER_TEMP"); fi
+          DEST="$TMP/jdk"
+          mkdir -p "$DEST"
+          case "$ARCHIVE" in
+            *.zip)    python -m zipfile -e "$ARCHIVE" "$DEST" ;;
+            *.tar.gz) tar -xzf "$ARCHIVE" -C "$DEST" ;;
+          esac
+          # The archive holds one directory. On macOS the JDK is in Contents/Home inside it.
+          TOP=$(echo "$DEST"/*/)
+          if [ -d "${TOP}Contents/Home" ]; then JAVA_HOME_DIR="${TOP}Contents/Home"; else JAVA_HOME_DIR="$TOP"; fi
+          JAVA_HOME_DIR=$(cd "$JAVA_HOME_DIR" && pwd)
+          if command -v cygpath >/dev/null; then JAVA_HOME_DIR=$(cygpath -w "$JAVA_HOME_DIR"); fi
+          echo "JAVA_HOME=$JAVA_HOME_DIR" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_DIR/bin" >> "$GITHUB_PATH"
+          echo "Installed to $JAVA_HOME_DIR"
+
+      - name: Check the installed JDK
+        run: |
+          set -euo pipefail
+          EXPECTED_MAJOR=$(python jdk_versions.py --auto --non-lts --version-only)
+          java -version
+          javac -version
+          # "java -version" reports the major version, such as "27.0.1", on the first line.
+          java -version 2>&1 | head -n 1 | grep -E "\"?${EXPECTED_MAJOR}[.\" ]" \
+            || { echo "java does not report major version $EXPECTED_MAJOR" >&2; exit 1; }
