@@ -72,11 +72,11 @@ Let the script detect the machine instead of naming the platform:
 python3 jdk_versions.py --auto --lts
 ```
 
-Get the newest LTS download link for a script. `--no-header` leaves out the CSV header, and
-`cut -d, -f8` picks the `url` column:
+Get the newest LTS download link for a script. `--fields url` keeps only that column, and
+`--no-header` drops the CSV header so the URL is the only output:
 
 ```
-python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --csv --no-header | cut -d, -f8
+python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --csv --no-header --fields url
 ```
 
 Download the newest LTS tarball, verify its SHA-256 checksum, and save it to `jdks/`:
@@ -88,12 +88,11 @@ python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --download --targe
 On ARM64 Linux (for example a Raspberry Pi 4/5 or AWS Graviton), use `--arch aarch64`. On Alpine
 Linux use `--os alpine-linux`, which needs its own musl builds. `--os linux` does not include them.
 
-Read values in a shell script, here with `jq`:
+Read individual values in a shell script:
 
 ```
-python3 jdk_versions.py --lts --json | jq -r '.releases[].major'
-python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --json \
-  | jq -r '.releases[0].downloads["linux-x64"].url'
+python3 jdk_versions.py --lts --version-only
+python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --csv --no-header --fields url
 ```
 
 Capture a single number:
@@ -499,7 +498,7 @@ $ python3 jdk_versions.py --os foo
 That keeps stdout clean for pipes. In a script:
 
 ```
-if ! URL=$(python3 jdk_versions.py --auto --lts --count 1 --csv --no-header | cut -d, -f8); then
+if ! URL=$(python3 jdk_versions.py --auto --lts --count 1 --csv --no-header --fields url); then
   echo "lookup failed" >&2
 fi
 ```
