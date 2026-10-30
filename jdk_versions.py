@@ -10,7 +10,7 @@ Usage:
     python3 jdk_versions.py --major 21                                         # only JDK 21 (all platforms)
     python3 jdk_versions.py --major 21 --auto                                  # only JDK 21 for this machine
     python3 jdk_versions.py --source semeru --auto --lts                       # LTS Semeru (IBM) builds for this machine
-    python3 jdk_versions.py --source semeru --auto --lts --install --prefix-dir /java --install-prefix jdk   # download + install
+    python3 jdk_versions.py --source semeru --auto --lts --install --install-dir /java --install-prefix jdk   # download + install
     python3 jdk_versions.py --source all --auto --lts                          # LTS builds from every source for this machine
     python3 jdk_versions.py --all                                              # every available major release
     python3 jdk_versions.py --all --non-lts                                    # every non-LTS major release
@@ -21,7 +21,7 @@ Usage:
     python3 jdk_versions.py --auto --lts --download                                   # download the listed files to the current directory
     python3 jdk_versions.py --auto --lts --download --target-directory jdks            # download the listed files to jdks/
     python3 jdk_versions.py --auto --lts --download --target-directory jdks --force   # re-download even if already up to date
-    python3 jdk_versions.py --auto --lts --install --target-directory jdks --prefix-dir /java --install-prefix jdk   # download + install as /java/jdk25, /java/jdk21, ...
+    python3 jdk_versions.py --auto --lts --install --target-directory jdks --install-dir /java --install-prefix jdk   # download + install as /java/jdk25, /java/jdk21, ...
     python3 jdk_versions.py --count 3                                          # only the first 3 rows (works with all modes)
     python3 jdk_versions.py --csv                                              # CSV output (works with all modes)
     python3 jdk_versions.py --ea                                               # most recent early-access build
@@ -868,7 +868,7 @@ def finish_downloads(rows, args, show_bar):
         color = use_color(sys.stderr)
 
         def installer(archive, row):
-            dest = os.path.join(args.prefix_dir, f"{args.install_prefix}{row['major']}")
+            dest = os.path.join(args.install_dir, f"{args.install_prefix}{row['major']}")
             if not args.force and has_java(dest):
                 msg = f"skipping install of JDK {row['major']} ({dest} already exists)"
                 print(style(msg, DIM) if color else msg, file=sys.stderr)
@@ -879,7 +879,7 @@ def finish_downloads(rows, args, show_bar):
                     msg = (f"reinstalling JDK {row['major']} "
                            f"({dest} exists but bin/java is missing)")
                     print(style(msg, YELLOW) if color else msg, file=sys.stderr)
-                dest = install_jdk(archive, row["major"], args.prefix_dir, args.install_prefix)
+                dest = install_jdk(archive, row["major"], args.install_dir, args.install_prefix)
                 result = dest
             if args.verify_installed:
                 header = f"verifying JDK {row['major']} at {dest}"
@@ -973,14 +973,14 @@ def main():
     )
     parser.add_argument(
         "--install", action="store_true",
-        help="unpack each downloaded JDK into --prefix-dir, as a directory named "
-             "--install-prefix followed by the major version (--prefix-dir /java "
+        help="unpack each downloaded JDK into --install-dir, as a directory named "
+             "--install-prefix followed by the major version (--install-dir /java "
              "--install-prefix jdk puts JDK 27 in /java/jdk27). The directory holds the JDK "
              "itself (bin/, lib/ and so on) with no versioned directory inside it. Implies "
              "--download; one download per major version. An existing JDK there is replaced",
     )
     parser.add_argument(
-        "--prefix-dir", metavar="DIR",
+        "--install-dir", metavar="DIR",
         help="the directory --install installs into (created if it does not exist)",
     )
     parser.add_argument(
@@ -1059,7 +1059,7 @@ def main():
     if args.download and (args.list_arch or args.list_os or args.version_only):
         parser.error("argument --download: not allowed with --list-arch, --list-os or "
                      "--version-only")
-    install_args = {"--prefix-dir": args.prefix_dir, "--install-prefix": args.install_prefix}
+    install_args = {"--install-dir": args.install_dir, "--install-prefix": args.install_prefix}
     if args.install:
         for flag, value in install_args.items():
             if value is None:

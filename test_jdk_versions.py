@@ -2298,7 +2298,7 @@ class InstallFlagTests(TempDirTestCase):
         fetch, urlopen = world or archive_world()
         args = [*argv, "--plain", "--download", "--target-directory", self.dl]
         if install:
-            args += ["--install", "--prefix-dir", self.prefix, "--install-prefix", "jdk"]
+            args += ["--install", "--install-dir", self.prefix, "--install-prefix", "jdk"]
         with mock.patch.object(j.urllib.request, "urlopen", urlopen):
             return run(*args, fetch=fetch)
 
@@ -2368,7 +2368,7 @@ class InstallFlagTests(TempDirTestCase):
         with mock.patch.object(j.urllib.request, "urlopen",
                                side_effect=AssertionError("no download expected")):
             code, out, err = run("--lts", "--plain", "--download", "--target-directory", self.dl,
-                                 "--install", "--prefix-dir", self.prefix, "--install-prefix", "jdk",
+                                 "--install", "--install-dir", self.prefix, "--install-prefix", "jdk",
                                  fetch=fetch)
         self.assertEqual(code, 1)
         self.assertIn("exactly one download for each major version", json.loads(err)["error"])
@@ -2427,13 +2427,13 @@ class InstallFlagTests(TempDirTestCase):
         with mock.patch.object(j.urllib.request, "urlopen", urlopen):
             code, _, err = run("--lts", "--os", "linux", "--arch", "x64", "--count", "1", "--plain",
                                "--download", "--target-directory", self.dl, "--install",
-                               "--prefix-dir", self.prefix, "--install-prefix", "", fetch=fetch)
+                               "--install-dir", self.prefix, "--install-prefix", "", fetch=fetch)
         self.assertEqual(code, 0, err)
         self.assertEqual(os.listdir(self.prefix), ["25"])
 
 
 class InstallArgumentTests(unittest.TestCase):
-    FULL = ("--download", "--target-directory", "dl", "--install", "--prefix-dir", "p",
+    FULL = ("--download", "--target-directory", "dl", "--install", "--install-dir", "p",
             "--install-prefix", "jdk")
 
     def assert_rejected(self, *argv):
@@ -2445,11 +2445,11 @@ class InstallArgumentTests(unittest.TestCase):
         self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",
                              "--install-prefix", "jdk")
         self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",
-                             "--prefix-dir", "p")
+                             "--install-dir", "p")
         self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install")
 
     def test_the_prefix_flags_need_install(self):
-        self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--prefix-dir", "p")
+        self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install-dir", "p")
         self.assert_rejected("--lts", "--download", "--target-directory", "dl",
                              "--install-prefix", "jdk")
 
@@ -2457,7 +2457,7 @@ class InstallArgumentTests(unittest.TestCase):
         for bad in ("a/b", "../x", "/abs", "a b"):
             with self.subTest(bad=bad):
                 self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",
-                                     "--prefix-dir", "p", "--install-prefix", bad)
+                                     "--install-dir", "p", "--install-prefix", bad)
 
     def test_not_allowed_with_the_modes_that_cannot_download(self):
         for mode in ("--list-arch", "--list-os", "--version-only"):
@@ -2470,7 +2470,7 @@ class InstallArgumentTests(unittest.TestCase):
 
     def test_the_flags_are_in_the_help(self):
         _, out, _ = run("--h")
-        for flag in ("--install", "--prefix-dir", "--install-prefix"):
+        for flag in ("--install", "--install-dir", "--install-prefix"):
             self.assertIn(flag, out)
 
 

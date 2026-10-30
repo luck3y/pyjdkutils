@@ -18,7 +18,7 @@ Python standard library.
   published SHA-256 checksum. Already-downloaded files that are still current are skipped
   automatically; use `--force` to re-download regardless.
 - **Install** a downloaded JDK with a single flag (`--install` implies `--download`). Each major
-  version is unpacked into its own directory — `--prefix-dir /opt/java --install-prefix jdk` gives
+  version is unpacked into its own directory — `--install-dir /opt/java --install-prefix jdk` gives
   `/opt/java/jdk21`, `/opt/java/jdk25` and so on, with `bin/java` directly inside. An existing
   install is skipped unless the directory is broken or `--force` is given. If the directory exists
   but `bin/java` is missing the JDK is reinstalled automatically from the cached archive.
@@ -69,7 +69,7 @@ python3 jdk_versions.py                  # LTS releases plus the latest feature 
 python3 jdk_versions.py --auto           # the same, limited to downloads for this machine
 python3 jdk_versions.py --auto --lts --count 1 --download   # download the newest LTS for this machine
 python3 jdk_versions.py --auto --lts --count 1 \
-    --install --prefix-dir /opt/java --install-prefix jdk   # download + install
+    --install --install-dir /opt/java --install-prefix jdk   # download + install
 python3 jdk_versions.py --h              # list every option
 ```
 
@@ -218,8 +218,8 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--fields FIELD ...` | Outputs only these fields, in this order. See [Choosing fields](#choosing-fields). |
 | `--download` | Downloads every listed result into `--target-directory` (default: current directory). See [Downloading files](#downloading-files). |
 | `--target-directory DIR` | The directory `--download` saves files in (default: `.`). It is created if it does not exist. |
-| `--install` | Downloads (implies `--download`) and unpacks each JDK into `--prefix-dir`. See [Installing JDKs](#installing-jdks). |
-| `--prefix-dir DIR` | The directory `--install` installs into. It is created if it does not exist. |
+| `--install` | Downloads (implies `--download`) and unpacks each JDK into `--install-dir`. See [Installing JDKs](#installing-jdks). |
+| `--install-dir DIR` | The directory `--install` installs into. It is created if it does not exist. |
 | `--install-prefix PREFIX` | The start of each install directory's name. The major version is added to it, so `jdk` gives `jdk27`. |
 | `--force` | Re-downloads and re-installs even if the local archive already matches the remote SHA-256 checksum and the install directory already exists. |
 | `--verify-installed` | After each `--install`, immediately runs `java -version` and `javac -version` from the installed JDK and prints the result. Output is coloured on a terminal (cyan labels, yellow version strings, bold red on failure). Requires `--install`. |
@@ -237,8 +237,8 @@ Rules for combining options:
 - `--target-directory` without `--download` is an error. `--download` without `--target-directory`
   saves to the current directory. `--download` cannot be used with `--version-only`, `--list-arch`
   or `--list-os`.
-- `--install` implies `--download`. It requires `--prefix-dir` and `--install-prefix`;
-  `--target-directory` defaults to `.` as usual. `--prefix-dir` and `--install-prefix` cannot be
+- `--install` implies `--download`. It requires `--install-dir` and `--install-prefix`;
+  `--target-directory` defaults to `.` as usual. `--install-dir` and `--install-prefix` cannot be
   used without `--install`.
 - `--force` only has an effect when `--download` or `--install` is also given.
 - `--verify-installed` requires `--install`.
@@ -385,11 +385,11 @@ python3 jdk_versions.py --ea --os windows --arch x64 --download --target-directo
 ## Installing JDKs
 
 `--install` downloads (implies `--download`) and unpacks each JDK. Each one goes into its own
-directory under `--prefix-dir`, named `--install-prefix` followed by the major version.
+directory under `--install-dir`, named `--install-prefix` followed by the major version.
 
 ```
 python3 jdk_versions.py --auto --non-lts --count 1 \
-    --install --target-directory ~/dl --prefix-dir /java --install-prefix jdk
+    --install --target-directory ~/dl --install-dir /java --install-prefix jdk
 ```
 
 If the newest feature release is JDK 27, that installs it as `/java/jdk27`. With `--lts --count 2`
@@ -399,7 +399,7 @@ Add `--verify-installed` to confirm each JDK works immediately after it is insta
 
 ```
 python3 jdk_versions.py --auto --lts --count 1 \
-    --install --target-directory ~/dl --prefix-dir /java --install-prefix jdk \
+    --install --target-directory ~/dl --install-dir /java --install-prefix jdk \
     --verify-installed
 ```
 
@@ -424,12 +424,12 @@ python3 jdk_versions.py --auto --lts --count 1 \
   and no `release` file), a plain file or a symbolic link is never replaced; that install fails and
   nothing is deleted.
 - **The prefix may contain letters, digits, `.`, `_`, `+` and `-`.** It cannot contain a path
-  separator, so installs always land directly under `--prefix-dir`. An empty prefix is allowed and
+  separator, so installs always land directly under `--install-dir`. An empty prefix is allowed and
   gives `/java/27`.
 - **The archives stay in `--target-directory`.** Delete them when you no longer need them.
 - **Archives are unpacked safely.** Files that would land outside the install directory, and links
   pointing outside it, are rejected. Links inside the JDK are kept. The JDK is unpacked in a
-  temporary directory inside `--prefix-dir` first, so a failed install leaves no partial JDK.
+  temporary directory inside `--install-dir` first, so a failed install leaves no partial JDK.
 - **Failures are per JDK.** A JDK that fails to install does not stop the others. The script prints
   one JSON error for it on stderr and exits with code 1.
 - Each success prints `installed <path>` on stderr, and the summary line reports
@@ -548,8 +548,8 @@ error. Pass `--os` and `--arch` yourself in that case.
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, the jdk.java.net page layout changed, a `--download` failed (an unusable target directory, a network error or a checksum mismatch), or an `--install` failed (an archive that is not a JDK, an unusable `--prefix-dir`, or two downloads for one major version). |
-| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name, `--target-directory` without `--download`, or `--install` without `--prefix-dir` or `--install-prefix`. |
+| `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, the jdk.java.net page layout changed, a `--download` failed (an unusable target directory, a network error or a checksum mismatch), or an `--install` failed (an archive that is not a JDK, an unusable `--install-dir`, or two downloads for one major version). |
+| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name, `--target-directory` without `--download`, or `--install` without `--install-dir` or `--install-prefix`. |
 
 Runtime failures print a JSON object on **stderr**, and nothing on stdout:
 
@@ -605,7 +605,7 @@ x64. `--install` implies `--download`, so a single command fetches, verifies and
 ```
 python jdk_versions.py --auto --non-lts --count 1 \
     --install --target-directory "$DOWNLOAD_DIR" \
-    --prefix-dir "$PREFIX_DIR" --install-prefix jdk
+    --install-dir "$PREFIX_DIR" --install-prefix jdk
 ```
 
 The workflow then sets `JAVA_HOME` and `PATH` from the known install path and runs `java -version`.
