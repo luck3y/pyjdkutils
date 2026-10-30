@@ -138,8 +138,8 @@ python jdk_versions.py --lts --os windows --arch x64
 ```
 
 `--os` accepts `windows`, `win` and `win32`. Windows builds are `.zip` files. For ARM64 Windows use
-`--arch aarch64`. Note that Windows on ARM builds are not available for every release. Check with
-`--all --os windows --arch aarch64 --version-only`.
+`--arch aarch64`. Windows on ARM builds exist for only a few releases (at the time of writing, 21
+and 23). Check with `--all --os windows --arch aarch64 --version-only`.
 
 Download the newest LTS zip and verify it in PowerShell:
 
@@ -149,16 +149,17 @@ $row = python jdk_versions.py --lts --os windows --arch x64 --count 1 --json |
 $dl  = $row.releases[0].downloads.'windows-x64'
 
 Invoke-WebRequest -Uri $dl.url -OutFile jdk.zip
-$expected = (Invoke-WebRequest -Uri $dl.sha256_url).Content.Split(' ')[0].Trim()
+Invoke-WebRequest -Uri $dl.sha256_url -OutFile jdk.zip.sha256
+$expected = (Get-Content jdk.zip.sha256 -TotalCount 1).Split(' ')[0].Trim()
 $actual   = (Get-FileHash jdk.zip -Algorithm SHA256).Hash
 if ($actual -ieq $expected) { 'checksum OK' } else { throw 'checksum mismatch' }
 ```
 
-The same thing from `cmd.exe`, using the CSV output:
+The checksum file is saved to disk and read back as text, because the server sends it as a binary
+content type and `Invoke-WebRequest` would otherwise return raw bytes.
 
-```
-python jdk_versions.py --lts --os windows --arch x64 --count 1 --csv --no-header
-```
+`cmd.exe` has no good way to parse the output. Use PowerShell, or run the script with `--csv` and
+read the result with whatever tool you have.
 
 ### Early-access builds
 
