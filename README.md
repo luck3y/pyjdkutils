@@ -88,18 +88,19 @@ python3 jdk_versions.py --lts --os linux --arch x64
 ```
 
 ```
-+-------+-----------------+-----------------+------+----------------------+-------+------+-----------------------+
-| major | version         | release_name    | lts  | released             | os    | arch | url                   |
-+-------+-----------------+-----------------+------+----------------------+-------+------+-----------------------+
-| 25    | 25.0.5+8.0.LTS  | jdk-25.0.5+8    | true | 2026-10-22T12:28:52Z | linux | x64  | https://github.com/…  |
-| 21    | 21.0.13+9.0.LTS | jdk-21.0.13+9   | true | 2026-10-22T12:07:52Z | linux | x64  | https://github.com/…  |
-| 17    | 17.0.21+9       | jdk-17.0.21+9   | true | 2026-10-22T17:28:37Z | linux | x64  | https://github.com/…  |
-| 11    | 11.0.32+101     | jdk-11.0.32.1+1 | true | 2026-08-24T08:24:03Z | linux | x64  | https://github.com/…  |
-| 8     | 8.0.504+1       | jdk8u504-b01    | true | 2026-08-25T08:14:51Z | linux | x64  | https://github.com/…  |
-+-------+-----------------+-----------------+------+----------------------+-------+------+-----------------------+
++-------+-----------------+-----------------+------+----------------------+--------------------------------+-------+------+-------------------------------------------------------+
+| major | version         | release_name    | lts  | released             | source                         | os    | arch | url                                                   |
++-------+-----------------+-----------------+------+----------------------+--------------------------------+-------+------+-------------------------------------------------------+
+| 25    | 25.0.5+8.0.LTS  | jdk-25.0.5+8    | true | 2026-10-22T12:28:52Z | Eclipse Temurin (Adoptium API) | linux | x64  | …/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz   |
+| 21    | 21.0.13+9.0.LTS | jdk-21.0.13+9   | true | 2026-10-22T12:07:52Z | Eclipse Temurin (Adoptium API) | linux | x64  | …/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz  |
+| 17    | 17.0.21+9       | jdk-17.0.21+9   | true | 2026-10-22T17:28:37Z | Eclipse Temurin (Adoptium API) | linux | x64  | …/OpenJDK17U-jdk_x64_linux_hotspot_17.0.21_9.tar.gz  |
+| 11    | 11.0.32+101     | jdk-11.0.32.1+1 | true | 2026-08-24T08:24:03Z | Eclipse Temurin (Adoptium API) | linux | x64  | …/OpenJDK11U-jdk_x64_linux_hotspot_11.0.32.1_1.tar.gz|
+| 8     | 8.0.504+1       | jdk8u504-b01    | true | 2026-08-25T08:14:51Z | Eclipse Temurin (Adoptium API) | linux | x64  | …/OpenJDK8U-jdk_x64_linux_hotspot_8u504b01.tar.gz    |
++-------+-----------------+-----------------+------+----------------------+--------------------------------+-------+------+-------------------------------------------------------+
 ```
 
-The table cuts the URL short here for the page. The real output shows the full link.
+The table shortens URLs to the filename (`…/<name>`) by default to keep it readable. Use
+`--full-url` to show the complete link in the table. CSV and JSON always contain the full URL.
 
 Let the script detect the machine instead of naming the platform:
 
@@ -208,6 +209,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--arch ARCH` | Keeps only downloads for this architecture. See [Platform names](#platform-names). |
 | `--os OS` | Keeps only downloads for this operating system. See [Platform names](#platform-names). |
 | `--auto` | Detects this machine's OS and architecture and filters for them. An explicit `--os` or `--arch` takes precedence over the detected value. |
+| `--full-url` | Shows the complete download URL in the table instead of the default `…/<filename>` form. Has no effect on CSV or JSON output, which always contain the full URL. |
 | `--count N` | Returns only the first `N` rows. See [How filtering and `--count` work](#how-filtering-and---count-work). |
 | `--version-only` | Returns only the major version numbers. |
 | `--json` | Prints JSON instead of a table. |
@@ -240,8 +242,9 @@ Rules for combining options:
   used without `--install`.
 - `--force` only has an effect when `--download` or `--install` is also given.
 - `--verify-installed` requires `--install`.
+- `--full-url` only affects table output; it has no effect with `--csv` or `--json`.
 - `--count` must be a whole number of 1 or more.
-- Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--download`, `--install`,
+- Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--full-url`, `--download`, `--install`,
   `--plain` and the output formats work with `--ea` too.
 - The long flags can be shortened as long as the prefix is unambiguous (argparse behavior).
 
@@ -260,12 +263,13 @@ For GA releases, each row is one release and one platform download:
 | `release_name` | Adoptium's name for the release. |
 | `lts` | `true` or `false`. |
 | `released` | Timestamp of the linux/x64 binary. |
+| `source` | The distribution label, e.g. `Eclipse Temurin (Adoptium API)`. Always populated in every output row. |
 | `os`, `arch` | The platform of this download. |
-| `url` | Download link. |
-| `sha256_url` | Link to the SHA-256 checksum file. CSV only. The table leaves it out unless you ask for it with `--fields`. |
+| `url` | Download link. In the table, shortened to `…/<filename>` by default; use `--full-url` to show the full link. CSV and JSON always contain the full URL. |
+| `sha256_url` | Link to the SHA-256 checksum file. Not shown in the table by default; use `--fields sha256_url` to include it. Always present in CSV. |
 
-For `--ea`, the columns are `major`, `version`, `build`, `released`, `os`, `arch`, `url` and
-`sha256_url`.
+For `--ea`, the columns are `major`, `version`, `build`, `released`, `source`, `os`, `arch`, `url`
+and `sha256_url`.
 
 `--list-arch` and `--list-os` produce a single column, `arch` or `os`.
 
@@ -573,9 +577,7 @@ responses) are reported this way. Each request has a 20 second timeout. The scri
 - **`--ea` reads a web page.** jdk.java.net has no API for early-access builds, so the script reads
   the site's HTML. If Oracle changes the page layout, `--ea` exits with an error until the script is
   updated. These builds come from the OpenJDK project, not from oracle.com.
-- **Only Temurin builds are reported for GA releases.** This is not Oracle JDK or any other
-  vendor's distribution. Early-access builds (`--ea`) come from jdk.java.net and are produced by
-  the Oracle-led OpenJDK project, not from oracle.com.
+- **GA releases come from the configured source.** The default is Eclipse Temurin (`--source temurin`). Use `--source semeru` for IBM Semeru, or `--source all` to merge both. Early-access builds (`--ea`) always come from jdk.java.net and are produced by the Oracle-led OpenJDK project, not from oracle.com.
 - **`--auto` reports what Python reports.** A 32-bit Python on a 64-bit Windows machine may report
   `x32`, which matches nothing. Pass `--arch x64` in that case.
 - **Early-access downloads** are for gathering feedback and may be removed or changed at any time.

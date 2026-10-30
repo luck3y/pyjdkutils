@@ -17,6 +17,7 @@ Usage:
     python3 jdk_versions.py --arch x64                                         # only x64 downloads (works with all modes)
     python3 jdk_versions.py --auto                                             # only downloads for this machine's OS and architecture
     python3 jdk_versions.py --auto --lts --count 1                             # newest LTS download for this machine
+    python3 jdk_versions.py --auto --lts --full-url                                   # table output with full download URLs
     python3 jdk_versions.py --auto --lts --download                                   # download the listed files to the current directory
     python3 jdk_versions.py --auto --lts --download --target-directory jdks            # download the listed files to jdks/
     python3 jdk_versions.py --auto --lts --download --target-directory jdks --force   # re-download even if already up to date
@@ -32,6 +33,7 @@ Usage:
     python3 jdk_versions.py --lts                                              # only LTS releases
     python3 jdk_versions.py --lts --os macos --arch aarch64                    # LTS releases, macOS/aarch64 only
     python3 jdk_versions.py --lts --version-only                               # LTS major versions, one per line
+    python3 jdk_versions.py --full-url                                         # table output with full download URLs
     python3 jdk_versions.py --no-header                                        # table or CSV without the header row
     python3 jdk_versions.py --non-lts                                          # only the latest non-LTS feature release
     python3 jdk_versions.py --non-lts --version-only                           # just the major version, e.g. 27
@@ -293,16 +295,32 @@ def cell_codes(column, value, majors=None):
     return ()
 
 
-def format_table(columns, rows, header=True, keep_sha256=False, color=False):
+def shorten_url(url):
+    """Replace the scheme+host+path prefix of a URL with '…/', keeping only the filename.
+
+    Used by format_table to keep the url/sha256_url columns narrow without losing information
+    in CSV or JSON output. Returns the value unchanged if it has no '/' after the scheme.
+    """
+    if "://" not in url:
+        return url
+    name = url.rsplit("/", 1)[-1]
+    return f"\u2026/{name}" if name else url
+
+
+def format_table(columns, rows, header=True, keep_sha256=False, color=False, full_url=False):
     """Render rows as a plain-text table.
 
     The sha256_url column is left out by default to keep the table readable; keep_sha256=True
     includes it. With header=False the column names and the rule beneath them are left out.
     color=True adds ANSI colors; padding is applied before coloring so columns stay aligned.
+    Unless full_url=True, url and sha256_url values are shortened to just the filename (…/<name>)
+    to keep the table narrow; the full URLs are preserved in CSV and JSON output.
     """
     if not keep_sha256:
         columns = [c for c in columns if c != "sha256_url"]
-    cells = [[cell(row.get(c)) for c in columns] for row in rows]
+    url_cols = {"url", "sha256_url"}
+    cells = [[(shorten_url(cell(row.get(c))) if not full_url and c in url_cols
+               else cell(row.get(c))) for c in columns] for row in rows]
     widths = [max([len(c)] + [len(r[i]) for r in cells]) for i, c in enumerate(columns)]
 
     def paint(text, *codes):
@@ -321,7 +339,7 @@ def format_table(columns, rows, header=True, keep_sha256=False, color=False):
     return "\n".join([border, *head, *body, border])
 
 
-def emit(payload, fmt, columns, rows, header=True, fields=None, color=False):
+def emit(payload, fmt, columns, rows, header=True, fields=None, color=False, full_url=False):
     """Write the result to stdout as a table, indented JSON, or CSV.
 
     header=False drops the header row from the table and CSV output; JSON is unaffected.
@@ -331,6 +349,7 @@ def emit(payload, fmt, columns, rows, header=True, fields=None, color=False):
     source/arch/os envelope plus a flat "rows" list of objects holding only those fields.
 
     color=True colors the table. CSV and JSON are never colored.
+    full_url=True prints full URLs in the table instead of the default …/<filename> form.
     """
     if fields:
         columns = fields
@@ -348,7 +367,8 @@ def emit(payload, fmt, columns, rows, header=True, fields=None, color=False):
     elif fmt == "json":
         print(json.dumps(payload, indent=2))
     else:
-        print(format_table(columns, rows, header, keep_sha256=bool(fields), color=color))
+        print(format_table(columns, rows, header, keep_sha256=bool(fields), color=color,
+                           full_url=full_url))
 
 
 def emit_versions(source, arch, os_name, majors, fmt, header=True):
@@ -983,6 +1003,11 @@ def main():
         help="detect this machine's OS and architecture and filter for them. An explicit "
              "--os or --arch takes precedence over the detected value",
     )
+    parser.add_argument(
+        "--full-url", action="store_true",
+        help="show the full download URL in the table instead of the shortened …/<filename> form "
+             "(CSV and JSON always contain the full URL regardless of this flag)",
+    )
     source_names = ", ".join(SOURCES)
     source_aliases = ", ".join(f"{k} -> {v}" for k, v in SOURCE_ALIASES.items())
     parser.add_argument(
@@ -1051,6 +1076,7 @@ def main():
     header = not args.no_header
     color = not args.plain and use_color(sys.stdout)
     show_bar = not args.plain and is_interactive(sys.stderr)
+    full_url = args.full_url
 
     if args.list_arch:
         # api_base is always set here: --source all is blocked above.
@@ -1113,7 +1139,7 @@ def main():
             "arch": args.arch,
             "os": args.os_name,
             "early_access": ea,
-        }, output_format, EA_COLUMNS, rows, header, fields, color)
+        }, output_format, EA_COLUMNS, rows, header, fields, color, full_url)
         return finish_downloads(rows, args, show_bar)
 
     sources_to_fetch = list(SOURCES.items()) if source_key == "all" else [(source_key, SOURCES[source_key])]
@@ -1208,7 +1234,7 @@ def main():
             source=r.get("source", source_label),
         )
     ]
-    emit(result, output_format, RELEASE_COLUMNS, rows, header, fields, color)
+    emit(result, output_format, RELEASE_COLUMNS, rows, header, fields, color, full_url)
     return finish_downloads(rows, args, show_bar)
 
 

@@ -1316,7 +1316,8 @@ class ColorTableTests(unittest.TestCase):
     def test_version_and_url_columns_have_their_own_colors(self):
         colored = j.format_table(self.COLUMNS, self.ROWS, color=True)
         self.assertIn("\x1b[1m25.0.1+1\x1b[0m", colored)
-        self.assertIn("\x1b[34mhttps://x.test/a \x1b[0m", colored)
+        # URLs are shortened to …/<filename> in the table; color is still applied.
+        self.assertIn("\x1b[34m\u2026/a ", colored)
 
     def test_cell_codes(self):
         self.assertEqual(j.cell_codes("lts", "true"), (j.GREEN,))
