@@ -173,6 +173,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--ea` | Returns only the most recent early-access build, from jdk.java.net. |
 | `--list-arch` | Lists the architectures Adoptium supports, then exits. |
 | `--list-os` | Lists the operating systems Adoptium supports, then exits. |
+| `--major N` | Keeps only results for this major version, e.g. `--major 21`. Works with all modes, including `--ea`, `--download` and `--install`. |
 | `--arch ARCH` | Keeps only downloads for this architecture. See [Platform names](#platform-names). |
 | `--os OS` | Keeps only downloads for this operating system. See [Platform names](#platform-names). |
 | `--auto` | Detects this machine's OS and architecture and filters for them. An explicit `--os` or `--arch` takes precedence over the detected value. |
@@ -194,6 +195,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 Rules for combining options:
 
 - `--lts`, `--non-lts`, `--ea`, `--list-arch` and `--list-os` are mutually exclusive.
+- `--major` can be combined with any mode. With `--lts` or `--non-lts` it further narrows the result; an error is returned if the requested version is not available or does not match the LTS/non-LTS filter.
 - `--json` and `--csv` are mutually exclusive.
 - `--auto` and `--version-only` cannot be used with `--list-arch` or `--list-os`.
 - `--fields` cannot be used with `--version-only`.

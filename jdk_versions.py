@@ -7,6 +7,8 @@ https://jdk.java.net for the latest Oracle-led OpenJDK early-access build.
 
 Usage:
     python3 jdk_versions.py                                                    # LTS releases + latest feature release, as a table
+    python3 jdk_versions.py --major 21                                         # only JDK 21 (all platforms)
+    python3 jdk_versions.py --major 21 --auto                                  # only JDK 21 for this machine
     python3 jdk_versions.py --all                                              # every available major release
     python3 jdk_versions.py --all --non-lts                                    # every non-LTS major release
     python3 jdk_versions.py --arch x64                                         # only x64 downloads (works with all modes)
@@ -167,9 +169,11 @@ def limit_releases(releases, count):
     return limited
 
 
-def describe_filters(arch, os_name):
+def describe_filters(arch, os_name, major=None):
     return " and ".join(
-        f"{label} '{value}'" for label, value in (("architecture", arch), ("os", os_name)) if value
+        f"{label} '{value}'"
+        for label, value in (("major version", major), ("architecture", arch), ("os", os_name))
+        if value is not None
     )
 
 
@@ -818,6 +822,11 @@ def main():
              "'major' column). Not available with --list-arch or --list-os",
     )
     parser.add_argument(
+        "--major", type=positive_int, metavar="N",
+        help="only include results for this major version, e.g. --major 21. "
+             "Works with all modes, including --ea, --download and --install",
+    )
+    parser.add_argument(
         "--arch", type=normalize_arch, metavar="ARCH",
         help="only include downloads for this architecture, e.g. x64, aarch64, arm, "
              "ppc64le, s390x, riscv64 (aliases: amd64, x86_64 -> x64; arm64 -> aarch64)",
@@ -962,6 +971,12 @@ def main():
         except (*NETWORK_ERRORS, ValueError) as exc:
             print(json.dumps({"error": f"failed to fetch early-access build: {exc}"}), file=sys.stderr)
             return 1
+        if args.major is not None and ea["major"] != args.major:
+            print(json.dumps({
+                "error": f"no early-access build for major version {args.major} "
+                         f"(current early-access is JDK {ea['major']})"
+            }), file=sys.stderr)
+            return 1
         if args.arch or args.os_name:
             ea["downloads"] = filter_downloads(ea["downloads"], args.arch, args.os_name)
             if not ea["downloads"]:
@@ -987,7 +1002,15 @@ def main():
     try:
         info = get_json("/info/available_releases")
         lts = set(info["available_lts_releases"])
-        if args.all:
+        if args.major is not None:
+            if args.major not in info["available_releases"]:
+                print(json.dumps({
+                    "error": f"major version {args.major} is not available "
+                             f"(available: {', '.join(str(m) for m in sorted(info['available_releases']))})"
+                }), file=sys.stderr)
+                return 1
+            majors = [args.major]
+        elif args.all:
             majors = info["available_releases"]
         else:
             majors = sorted(lts | {info["most_recent_feature_release"]})
@@ -1009,9 +1032,10 @@ def main():
         print(json.dumps({"error": f"failed to fetch JDK releases: {exc}"}), file=sys.stderr)
         return 1
 
-    if (args.arch or args.os_name) and not releases:
+    if not releases:
         print(json.dumps({
-            "error": f"no releases with downloads for {describe_filters(args.arch, args.os_name)}"
+            "error": f"no releases with downloads for "
+                     f"{describe_filters(args.arch, args.os_name, args.major)}"
         }), file=sys.stderr)
         return 1
 
