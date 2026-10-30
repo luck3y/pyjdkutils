@@ -199,6 +199,19 @@ def cell(value):
 
 BOLD, DIM, GREEN, YELLOW, BLUE, CYAN = "1", "2", "32", "33", "34", "36"
 
+# Colors that group rows in the table. Each OS and architecture has a fixed color, so "linux" or
+# "aarch64" looks the same in every run. Majors get the next color from MAJOR_COLORS in the order
+# they first appear, so the rows of one release share a color and neighbouring releases differ.
+# Names that aren't listed get a color derived from the name. Red is not used for an OS or
+# architecture, because it reads as an error, and plain white and black are avoided because one of
+# them is unreadable on any terminal background.
+OS_COLORS = {"linux": "35", "alpine-linux": "95", "macos": "36", "windows": "94", "aix": "34",
+             "solaris": "33"}
+ARCH_COLORS = {"x64": "96", "aarch64": "92", "arm": "93", "x32": "34", "ppc64": "95",
+               "ppc64le": "35", "s390x": "94", "riscv64": "36", "sparcv9": "33"}
+MAJOR_COLORS = ["91", "92", "93", "94", "95", "96"]
+FALLBACK_COLORS = MAJOR_COLORS[1:]  # for OS and architecture names that aren't listed: no red
+
 
 def style(text, *codes):
     """Wrap text in ANSI escape codes (no-op without codes)."""
@@ -224,14 +237,29 @@ def use_color(stream):
     return True
 
 
-def cell_codes(column, value):
-    """The ANSI codes for one table cell, chosen by its column and value."""
+def group_color(colors, value):
+    """The fixed color for value, or one derived from its name if it isn't in colors."""
+    return colors.get(value) or FALLBACK_COLORS[sum(map(ord, value)) % len(FALLBACK_COLORS)]
+
+
+def cell_codes(column, value, majors=None):
+    """The ANSI codes for one table cell, chosen by its column and value.
+
+    majors is a dict shared by every cell of one table, which hands out a color to each major
+    version the first time it is seen. Without it the major column is left uncolored.
+    """
     if column == "lts":
         return (GREEN,) if value == "true" else (YELLOW,)
     if column == "version":
         return (BOLD,)
     if column in ("url", "sha256_url"):
         return (BLUE,)
+    if column == "os" and value:
+        return (group_color(OS_COLORS, value),)
+    if column == "arch" and value:
+        return (group_color(ARCH_COLORS, value),)
+    if column == "major" and majors is not None and value:
+        return (BOLD, majors.setdefault(value, MAJOR_COLORS[len(majors) % len(MAJOR_COLORS)]))
     return ()
 
 
@@ -257,8 +285,10 @@ def format_table(columns, rows, header=True, keep_sha256=False, color=False):
         parts = [paint(v.ljust(w), *codes_for(c, v)) for c, v, w in zip(columns, values, widths)]
         return f"{bar} " + f" {bar} ".join(parts) + f" {bar}"
 
+    majors = {}
     head = [line(columns, lambda c, v: (BOLD, CYAN)), border] if header else []
-    return "\n".join([border, *head, *(line(r, cell_codes) for r in cells), border])
+    body = [line(r, lambda c, v: cell_codes(c, v, majors)) for r in cells]
+    return "\n".join([border, *head, *body, border])
 
 
 def emit(payload, fmt, columns, rows, header=True, fields=None, color=False):

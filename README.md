@@ -362,6 +362,22 @@ are left out and you see the bytes done and the speed.
 for `true` and yellow for `false`, and the `url` and `sha256_url` columns are blue. Only the
 default table is colored. CSV and JSON never are.
 
+Three columns are colored by group, so you can scan down a long table and see the pattern:
+
+- **`major`** is bold, and each major version gets the next color from red, green, yellow, blue,
+  magenta and cyan, in the order the versions appear. Every row of one release shares a color and
+  neighbouring releases differ. The colors start over for each table, so a given release may be a
+  different color in another run. After six versions they repeat.
+- **`os`** has one fixed color per operating system: `linux` magenta, `alpine-linux` bright
+  magenta, `macos` cyan, `windows` bright blue, `aix` blue and `solaris` yellow.
+- **`arch`** has one fixed color per architecture: `x64` bright cyan, `aarch64` bright green, `arm`
+  bright yellow, `x32` blue, `ppc64` bright magenta, `ppc64le` magenta, `s390x` bright blue,
+  `riscv64` cyan and `sparcv9` yellow.
+
+Red is not used for an OS or architecture, because it reads as an error. A name the script does not
+know gets a color worked out from the name, so it is the same every time. Your terminal's color
+scheme decides the exact shades.
+
 **Turning them off.** Use `--plain` to turn off both the colors and the progress bar. With
 `--plain` the output is the same text without the escape codes, and a download prints one
 `downloading <name>` line per file instead of a bar. They also turn off by themselves:

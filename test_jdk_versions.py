@@ -1310,7 +1310,8 @@ class ColorTableTests(unittest.TestCase):
     def test_cell_codes(self):
         self.assertEqual(j.cell_codes("lts", "true"), (j.GREEN,))
         self.assertEqual(j.cell_codes("lts", "false"), (j.YELLOW,))
-        self.assertEqual(j.cell_codes("os", "linux"), ())
+        self.assertEqual(j.cell_codes("released", "2026-01-01"), ())
+        self.assertEqual(j.cell_codes("release_name", "jdk-25"), ())
 
     def test_no_header_color_table(self):
         out = j.format_table(self.COLUMNS, self.ROWS, header=False, color=True)
@@ -1329,6 +1330,133 @@ class ColorTableTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             j.emit(payload, "table", self.COLUMNS, self.ROWS, color=True)
         self.assertIn("\x1b[", out.getvalue())
+
+
+class GroupColorTests(unittest.TestCase):
+    COLUMNS = ["major", "os", "arch"]
+
+    def rows(self, *triples):
+        return [{"major": m, "os": o, "arch": a} for m, o, a in triples]
+
+    def codes(self, text, word):
+        """The escape code that colors `word`, found in the colored text."""
+        match = re.search(r"\x1b\[([0-9;]+)m" + re.escape(word), text)
+        return match.group(1) if match else None
+
+    def test_every_known_os_and_arch_has_its_own_fixed_color(self):
+        for column, colors in (("os", j.OS_COLORS), ("arch", j.ARCH_COLORS)):
+            for name, code in colors.items():
+                with self.subTest(column=column, name=name):
+                    self.assertEqual(j.cell_codes(column, name), (code,))
+
+    def test_colors_are_distinct_within_a_column(self):
+        self.assertEqual(len(set(j.OS_COLORS.values())), len(j.OS_COLORS))
+        self.assertEqual(len(set(j.ARCH_COLORS.values())), len(j.ARCH_COLORS))
+
+    def test_os_and_arch_never_use_red_white_or_black(self):
+        avoided = {"30", "31", "37", "90", "91"}
+        self.assertFalse(avoided & set(j.OS_COLORS.values()))
+        self.assertFalse(avoided & set(j.ARCH_COLORS.values()))
+
+    def test_all_the_platforms_the_script_knows_about_have_a_color(self):
+        self.assertTrue(set(j.SYSTEM_OSES.values()) <= set(j.OS_COLORS))
+        self.assertTrue(set(j.MACHINE_ARCHES.values()) <= set(j.ARCH_COLORS))
+
+    def test_an_unknown_name_gets_a_stable_color_from_the_palette(self):
+        first = j.cell_codes("os", "haiku")
+        self.assertEqual(first, j.cell_codes("os", "haiku"))
+        self.assertIn(first[0], j.FALLBACK_COLORS)
+        self.assertIn(j.cell_codes("arch", "mips")[0], j.FALLBACK_COLORS)
+
+    def test_the_fallback_palette_has_no_red_and_names_spread_across_it(self):
+        self.assertNotIn("91", j.FALLBACK_COLORS)
+        used = {j.cell_codes("os", name)[0] for name in ("a", "b", "c", "d", "e", "haiku", "plan9")}
+        self.assertGreater(len(used), 2)
+        self.assertTrue(used <= set(j.FALLBACK_COLORS))
+
+    def test_blank_os_and_arch_are_not_colored(self):
+        self.assertEqual(j.cell_codes("os", ""), ())
+        self.assertEqual(j.cell_codes("arch", ""), ())
+
+    def test_the_same_os_has_the_same_color_in_every_row(self):
+        rows = self.rows((25, "linux", "x64"), (25, "macos", "aarch64"), (21, "linux", "aarch64"))
+        text = j.format_table(self.COLUMNS, rows, color=True)
+        self.assertEqual(len(re.findall(r"\x1b\[35mlinux", text)), 2)
+        self.assertEqual(len(re.findall(r"\x1b\[36mmacos", text)), 1)
+        self.assertEqual(len(re.findall(r"\x1b\[96mx64", text)), 1)
+        self.assertEqual(len(re.findall(r"\x1b\[92maarch64", text)), 2)
+
+    def test_each_major_gets_the_next_color_in_order_of_appearance(self):
+        rows = self.rows((27, "linux", "x64"), (27, "macos", "x64"), (25, "linux", "x64"),
+                         (21, "linux", "x64"), (27, "windows", "x64"))
+        lines = j.format_table(self.COLUMNS, rows, color=True, header=False).splitlines()[1:-1]
+        seen = [re.search(r"\x1b\[1;(\d+)m", line).group(1) for line in lines]
+        first, second, third = j.MAJOR_COLORS[:3]
+        self.assertEqual(seen, [first, first, second, third, first])
+
+    def test_major_colors_wrap_around_after_the_palette_is_used_up(self):
+        count = len(j.MAJOR_COLORS)
+        rows = [{"major": 100 + i} for i in range(count + 1)]
+        lines = j.format_table(["major"], rows, color=True, header=False).splitlines()[1:-1]
+        seen = [re.search(r"\x1b\[1;(\d+)m", line).group(1) for line in lines]
+        self.assertEqual(seen[:count], j.MAJOR_COLORS)
+        self.assertEqual(seen[count], j.MAJOR_COLORS[0])
+
+    def test_neighbouring_majors_differ(self):
+        rows = [{"major": m} for m in (27, 25, 21, 17, 11, 8)]
+        lines = j.format_table(["major"], rows, color=True, header=False).splitlines()[1:-1]
+        seen = [re.search(r"\x1b\[1;(\d+)m", line).group(1) for line in lines]
+        self.assertTrue(all(a != b for a, b in zip(seen, seen[1:])))
+
+    def test_each_table_starts_over_with_the_first_color(self):
+        rows = self.rows((25, "linux", "x64"))
+        a = j.format_table(self.COLUMNS, rows, color=True)
+        b = j.format_table(self.COLUMNS, rows, color=True)
+        self.assertEqual(a, b)
+        self.assertEqual(self.codes(a, "25"), "1;" + j.MAJOR_COLORS[0])
+
+    def test_major_is_uncolored_without_a_shared_dict(self):
+        self.assertEqual(j.cell_codes("major", "25"), ())
+        self.assertEqual(j.cell_codes("major", ""), (), "a blank major is never colored")
+        shared = {}
+        self.assertEqual(j.cell_codes("major", "25", shared), ("1", j.MAJOR_COLORS[0]))
+        self.assertEqual(shared, {"25": j.MAJOR_COLORS[0]})
+
+    def test_only_the_columns_that_are_shown_are_colored(self):
+        rows = self.rows((25, "linux", "x64"))
+        text = j.format_table(["os"], rows, color=True)
+        self.assertIn("\x1b[35mlinux", text)
+        self.assertNotIn("\x1b[96m", text)
+        self.assertNotIn("\x1b[1;", text.replace("\x1b[1;36m", ""))
+
+    def test_grouping_adds_only_escape_codes(self):
+        rows = self.rows((27, "linux", "x64"), (25, "windows", "aarch64"), (25, "macos", "x64"))
+        plain = j.format_table(self.COLUMNS, rows)
+        colored = j.format_table(self.COLUMNS, rows, color=True)
+        self.assertEqual(strip_ansi(colored), plain)
+        self.assertEqual(len({len(l) for l in strip_ansi(colored).splitlines()}), 1)
+
+    def test_a_row_from_the_script_is_grouped_end_to_end(self):
+        out = io.StringIO()
+        data = PlatformFixture.rows()
+        with contextlib.redirect_stdout(out):
+            j.emit({"source": "s", "arch": None, "os": None}, "table", j.RELEASE_COLUMNS, data,
+                   color=True)
+        text = out.getvalue()
+        self.assertIn("\x1b[35mlinux", text)
+        self.assertIn("\x1b[36mmacos", text)
+        self.assertIn("\x1b[94mwindows", text)
+        self.assertIn("\x1b[96mx64", text)
+        self.assertIn("\x1b[92maarch64", text)
+
+
+class PlatformFixture:
+    @staticmethod
+    def rows():
+        base = {"release_name": "r", "lts": True, "released": "d", "url": "u", "sha256_url": "s"}
+        return [{**base, "major": m, "version": f"{m}.0.1", "os": o, "arch": a}
+                for m, o, a in ((27, "linux", "x64"), (27, "macos", "aarch64"),
+                                (25, "windows", "x64"), (25, "linux", "aarch64"))]
 
 
 class FormatSizeTests(unittest.TestCase):
