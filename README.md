@@ -5,8 +5,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 [![License: BSD 2-Clause](https://img.shields.io/badge/license-BSD%202--Clause-blue)](LICENSE)
 
-A single-file Python tool for looking up, downloading and installing Eclipse Temurin JDKs. It
-needs no dependencies beyond the Python standard library.
+A single-file Python tool for looking up, downloading and installing JDKs. It covers Eclipse
+Temurin GA releases and Oracle-led early-access builds, and needs no dependencies beyond the
+Python standard library.
 
 **What it can do:**
 
@@ -27,8 +28,10 @@ needs no dependencies beyond the Python standard library.
 
 **Data sources:**
 
-- GA releases: [Adoptium API](https://api.adoptium.net) (Eclipse Temurin builds).
-- Early-access builds: [jdk.java.net](https://jdk.java.net) (Oracle-led OpenJDK).
+- **GA releases:** [Adoptium API](https://api.adoptium.net) — Eclipse Temurin builds for Linux,
+  macOS, Windows, AIX and more, across x64, aarch64 and other architectures.
+- **Early-access builds:** [jdk.java.net](https://jdk.java.net) — the Oracle-led OpenJDK
+  early-access builds for the next major version, before it reaches GA.
 
 Requires Python 3.11 or later. Uses only the standard library — nothing to install.
 
@@ -561,8 +564,9 @@ responses) are reported this way. Each request has a 20 second timeout. The scri
 - **`--ea` reads a web page.** jdk.java.net has no API for early-access builds, so the script reads
   the site's HTML. If Oracle changes the page layout, `--ea` exits with an error until the script is
   updated. These builds come from the OpenJDK project, not from oracle.com.
-- **Only Temurin builds are reported** for GA releases. This is not Oracle JDK or any other vendor's
-  distribution.
+- **Only Temurin builds are reported for GA releases.** This is not Oracle JDK or any other
+  vendor's distribution. Early-access builds (`--ea`) come from jdk.java.net and are produced by
+  the Oracle-led OpenJDK project, not from oracle.com.
 - **`--auto` reports what Python reports.** A 32-bit Python on a 64-bit Windows machine may report
   `x32`, which matches nothing. Pass `--arch x64` in that case.
 - **Early-access downloads** are for gathering feedback and may be removed or changed at any time.
