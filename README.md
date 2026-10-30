@@ -20,6 +20,7 @@ tested on Python 3.14.
   - [Early-access builds](#early-access-builds)
 - [Options](#options)
 - [Output formats](#output-formats)
+  - [Choosing fields](#choosing-fields)
 - [How filtering and `--count` work](#how-filtering-and---count-work)
 - [Platform names](#platform-names)
 - [Exit codes and errors](#exit-codes-and-errors)
@@ -164,7 +165,9 @@ read the result with whatever tool you have.
 ### Early-access builds
 
 `--ea` returns the newest early-access build from jdk.java.net. Early-access builds exist for
-Linux, macOS and Windows on `x64` and `aarch64`. They do not exist for every combination.
+Linux, macOS and Windows, but not for every architecture. At the time of writing the platforms are
+linux/x64, linux/aarch64, macos/aarch64 and windows/x64. Asking for a combination with no build is
+an error.
 
 ```
 python3 jdk_versions.py --ea --os linux --arch x64 --csv
@@ -192,6 +195,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--json` | Prints JSON instead of a table. |
 | `--csv` | Prints CSV instead of a table. |
 | `--no-header` | Leaves out the header row in table and CSV output. JSON is unaffected. |
+| `--fields FIELD ...` | Outputs only these fields, in this order. See [Choosing fields](#choosing-fields). |
 | `--h`, `--help` | Shows the help text. Note that `-h` is not accepted. |
 
 Rules for combining options:
@@ -199,6 +203,7 @@ Rules for combining options:
 - `--lts`, `--non-lts`, `--ea`, `--list-arch` and `--list-os` are mutually exclusive.
 - `--json` and `--csv` are mutually exclusive.
 - `--auto` and `--version-only` cannot be used with `--list-arch` or `--list-os`.
+- `--fields` cannot be used with `--version-only`.
 - `--count` must be a whole number of 1 or more.
 - Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header` and the
   output formats work with `--ea` too.
@@ -221,7 +226,7 @@ For GA releases, each row is one release and one platform download:
 | `released` | Timestamp of the linux/x64 binary. |
 | `os`, `arch` | The platform of this download. |
 | `url` | Download link. |
-| `sha256_url` | Link to the SHA-256 checksum file. CSV only. The table leaves it out. |
+| `sha256_url` | Link to the SHA-256 checksum file. CSV only. The table leaves it out unless you ask for it with `--fields`. |
 
 For `--ea`, the columns are `major`, `version`, `build`, `released`, `os`, `arch`, `url` and
 `sha256_url`.
@@ -270,6 +275,40 @@ python3 jdk_versions.py --non-lts --os windows --arch x64 --json
 - `downloads` is keyed by platform, such as `linux-x64` or `macos-aarch64`, and sorted by key.
 - `--ea` uses `"early_access"` in place of `"releases"`, and `--version-only` uses
   `"major_versions"`. The list commands use `"architectures"` and `"operating_systems"`.
+
+### Choosing fields
+
+`--fields` outputs only the fields you name, in the order you name them. Separate names with
+commas, spaces or both. Names are case-insensitive and duplicates are dropped.
+
+```
+python3 jdk_versions.py --lts --os linux --arch x64 --fields version,os,url
+python3 jdk_versions.py --lts --os linux --arch x64 --csv --no-header --fields url
+python3 jdk_versions.py --ea --fields version build url --json
+```
+
+- The valid fields are the column names listed above. For `--ea`, `release_name` is replaced by
+  `build`. `--list-arch` accepts only `arch`, and `--list-os` accepts only `os`.
+- An unknown field, an empty selection, or `--fields` together with `--version-only` exits with
+  code 2 before any network request is made.
+- Table and CSV output show just the chosen columns. `sha256_url` appears in the table only when
+  requested.
+- With `--json`, the output is a flat list instead of the nested `releases` and `downloads`
+  structure:
+
+  ```json
+  {
+    "source": "Eclipse Temurin (Adoptium API)",
+    "arch": "x64",
+    "os": "linux",
+    "rows": [
+      {"version": "25.0.1+8", "os": "linux", "url": "https://github.com/adoptium/…"}
+    ]
+  }
+  ```
+
+  Values keep their native types, so `lts` is a boolean.
+- Filters and `--count` still apply to fields that are not displayed.
 
 ## How filtering and `--count` work
 
@@ -325,7 +364,7 @@ error. Pass `--os` and `--arch` yourself in that case.
 |---|---|
 | `0` | Success. |
 | `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, or the jdk.java.net page layout changed. |
-| `2` | Bad usage, such as an unknown flag, a conflicting combination or an invalid `--count`. |
+| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count` or an unknown `--fields` name. |
 
 Runtime failures print a JSON object on **stderr**, and nothing on stdout:
 

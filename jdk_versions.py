@@ -6,27 +6,27 @@ Data sources: Adoptium API (https://api.adoptium.net) for GA releases and
 https://jdk.java.net for the latest Oracle-led OpenJDK early-access build.
 
 Usage:
-    python3 jdk_versions.py                    # LTS releases + latest feature release
-    python3 jdk_versions.py --all              # every available major release
-    python3 jdk_versions.py --lts              # only LTS releases
-    python3 jdk_versions.py --non-lts          # only the latest non-LTS feature release
-    python3 jdk_versions.py --all --non-lts    # every non-LTS major release
-    python3 jdk_versions.py --list-arch        # list all available architectures
-    python3 jdk_versions.py --list-os          # list all available operating systems
-    python3 jdk_versions.py --arch x64         # only x64 downloads (works with all modes)
-    python3 jdk_versions.py --os linux         # only linux downloads (works with all modes)
+    python3 jdk_versions.py                                   # LTS releases + latest feature release, as a table
+    python3 jdk_versions.py --all                             # every available major release
+    python3 jdk_versions.py --all --non-lts                   # every non-LTS major release
+    python3 jdk_versions.py --arch x64                        # only x64 downloads (works with all modes)
+    python3 jdk_versions.py --auto                            # only downloads for this machine's OS and architecture
+    python3 jdk_versions.py --auto --lts --count 1            # newest LTS download for this machine
+    python3 jdk_versions.py --count 3                         # only the first 3 rows (works with all modes)
+    python3 jdk_versions.py --csv                             # CSV output (works with all modes)
+    python3 jdk_versions.py --ea                              # most recent early-access build
+    python3 jdk_versions.py --fields version os url           # only these fields (commas also work)
+    python3 jdk_versions.py --h                               # show help (also --help)
+    python3 jdk_versions.py --json                            # JSON output
+    python3 jdk_versions.py --list-arch                       # list all available architectures
+    python3 jdk_versions.py --list-os                         # list all available operating systems
+    python3 jdk_versions.py --lts                             # only LTS releases
     python3 jdk_versions.py --lts --os macos --arch aarch64   # LTS releases, macOS/aarch64 only
-    python3 jdk_versions.py --ea               # most recent early-access build
-    python3 jdk_versions.py                    # formatted table (the default output)
-    python3 jdk_versions.py --json             # JSON output
-    python3 jdk_versions.py --csv              # CSV output (works with all modes)
-    python3 jdk_versions.py --non-lts --version-only   # just the major version, e.g. 27
-    python3 jdk_versions.py --lts --version-only       # LTS major versions, one per line
-    python3 jdk_versions.py --count 3          # only the first 3 rows (works with all modes)
-    python3 jdk_versions.py --no-header        # table or CSV without the header row
-    python3 jdk_versions.py --auto             # only downloads for this machine's OS and architecture
-    python3 jdk_versions.py --auto --lts --count 1   # newest LTS download for this machine
-    python3 jdk_versions.py --h                # show help (also --help)
+    python3 jdk_versions.py --lts --version-only              # LTS major versions, one per line
+    python3 jdk_versions.py --no-header                       # table or CSV without the header row
+    python3 jdk_versions.py --non-lts                         # only the latest non-LTS feature release
+    python3 jdk_versions.py --non-lts --version-only          # just the major version, e.g. 27
+    python3 jdk_versions.py --os linux                        # only linux downloads (works with all modes)
 """
 import argparse
 import csv
@@ -153,13 +153,51 @@ def describe_filters(arch, os_name):
     )
 
 
-def format_table(columns, rows, header=True):
-    """Render rows as a plain-text table. The sha256_url column is omitted to keep it readable.
+# The fields (columns) available for each kind of output, in their default order.
+RELEASE_COLUMNS = ["major", "version", "release_name", "lts", "released", "os", "arch", "url",
+                   "sha256_url"]
+EA_COLUMNS = ["major", "version", "build", "released", "os", "arch", "url", "sha256_url"]
 
-    With header=False the column names and the rule beneath them are left out.
+
+def parse_fields(raw, valid):
+    """Turn the --fields arguments into an ordered list of unique, validated field names.
+
+    Names may be separated by commas, spaces or both, so "version, os, url", "version,os,url" and
+    "version os url" are equivalent. Raises ValueError for an empty or unknown selection.
     """
-    columns = [c for c in columns if c != "sha256_url"]
-    cells = [["" if row.get(c) is None else str(row.get(c)) for c in columns] for row in rows]
+    names = []
+    for token in raw:
+        for name in re.split(r"[,\s]+", token.strip().lower()):
+            if name and name not in names:
+                names.append(name)
+    if not names:
+        raise ValueError("no field names given")
+    unknown = [n for n in names if n not in valid]
+    if unknown:
+        label = "field" if len(unknown) == 1 else "fields"
+        raise ValueError(f"unknown {label} {', '.join(repr(u) for u in unknown)} "
+                         f"(valid fields: {', '.join(valid)})")
+    return names
+
+
+def cell(value):
+    """Render a value for table and CSV output: None is blank, booleans are true/false."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def format_table(columns, rows, header=True, keep_sha256=False):
+    """Render rows as a plain-text table.
+
+    The sha256_url column is left out by default to keep the table readable; keep_sha256=True
+    includes it. With header=False the column names and the rule beneath them are left out.
+    """
+    if not keep_sha256:
+        columns = [c for c in columns if c != "sha256_url"]
+    cells = [[cell(row.get(c)) for c in columns] for row in rows]
     widths = [max([len(c)] + [len(r[i]) for r in cells]) for i, c in enumerate(columns)]
     border = "+-" + "-+-".join("-" * w for w in widths) + "-+"
 
@@ -170,20 +208,28 @@ def format_table(columns, rows, header=True):
     return "\n".join([border, *head, *(line(r) for r in cells), border])
 
 
-def emit(payload, fmt, columns, rows, header=True):
+def emit(payload, fmt, columns, rows, header=True, fields=None):
     """Write the result to stdout as a table, indented JSON, or CSV.
 
     header=False drops the header row from the table and CSV output; JSON is unaffected.
+
+    fields, if given, is the list of columns to output, in that order. Table and CSV show just
+    those columns (the table includes sha256_url if it is asked for). JSON becomes the usual
+    source/arch/os envelope plus a flat "rows" list of objects holding only those fields.
     """
+    if fields:
+        columns = fields
+        rows = [{f: row.get(f) for f in fields} for row in rows]
+        payload = {**{k: payload[k] for k in ("source", "arch", "os")}, "rows": rows}
     if fmt == "csv":
         writer = csv.writer(sys.stdout, lineterminator="\n")
         if header:
             writer.writerow(columns)
-        writer.writerows([row.get(c) for c in columns] for row in rows)
+        writer.writerows([cell(row.get(c)) for c in columns] for row in rows)
     elif fmt == "json":
         print(json.dumps(payload, indent=2))
     else:
-        print(format_table(columns, rows, header))
+        print(format_table(columns, rows, header, keep_sha256=bool(fields)))
 
 
 def emit_versions(source, arch, os_name, majors, fmt, header=True):
@@ -331,6 +377,13 @@ def main():
         help="omit the header row from table and CSV output (JSON is unaffected)",
     )
     parser.add_argument(
+        "--fields", nargs="+", metavar="FIELD",
+        help="only output these fields, in this order, separated by commas, spaces or both, "
+             "e.g. --fields version,os,url. Releases: " + ", ".join(RELEASE_COLUMNS)
+             + ". With --ea: " + ", ".join(EA_COLUMNS) + ". --list-arch: arch. --list-os: os. "
+             "JSON output becomes a flat 'rows' list. Not available with --version-only",
+    )
+    parser.add_argument(
         "--auto", action="store_true",
         help="detect this machine's OS and architecture and filter for them. An explicit "
              "--os or --arch takes precedence over the detected value",
@@ -340,6 +393,16 @@ def main():
         parser.error("argument --version-only: not allowed with --list-arch or --list-os")
     if args.auto and (args.list_arch or args.list_os):
         parser.error("argument --auto: not allowed with --list-arch or --list-os")
+    fields = None
+    if args.fields:
+        if args.version_only:
+            parser.error("argument --fields: not allowed with --version-only")
+        valid = (["arch"] if args.list_arch else ["os"] if args.list_os
+                 else EA_COLUMNS if args.early_access else RELEASE_COLUMNS)
+        try:
+            fields = parse_fields(args.fields, valid)
+        except ValueError as exc:
+            parser.error(f"argument --fields: {exc}")
     if args.auto:
         try:
             detected_os, detected_arch = detect_platform()
@@ -363,7 +426,7 @@ def main():
             "arch": args.arch,
             "os": args.os_name,
             "architectures": archs,
-        }, output_format, ["arch"], [{"arch": a} for a in archs], header)
+        }, output_format, ["arch"], [{"arch": a} for a in archs], header, fields)
         return 0
 
     if args.list_os:
@@ -377,7 +440,7 @@ def main():
             "arch": args.arch,
             "os": args.os_name,
             "operating_systems": oses,
-        }, output_format, ["os"], [{"os": o} for o in oses], header)
+        }, output_format, ["os"], [{"os": o} for o in oses], header, fields)
         return 0
 
     if args.early_access:
@@ -403,11 +466,10 @@ def main():
             "arch": args.arch,
             "os": args.os_name,
             "early_access": ea,
-        }, output_format,
-            ["major", "version", "build", "released", "os", "arch", "url", "sha256_url"],
+        }, output_format, EA_COLUMNS,
             download_rows(ea["downloads"], major=ea["major"], version=ea["version"],
                           build=ea["build"], released=ea["released"]),
-            header)
+            header, fields)
         return 0
 
     try:
@@ -459,12 +521,10 @@ def main():
         row for r in releases
         for row in download_rows(
             r["downloads"], major=r["major"], version=r["version"], release_name=r["release_name"],
-            lts=str(r["lts"]).lower(), released=r["released"],
+            lts=r["lts"], released=r["released"],
         )
     ]
-    emit(result, output_format,
-         ["major", "version", "release_name", "lts", "released", "os", "arch", "url", "sha256_url"],
-         rows, header)
+    emit(result, output_format, RELEASE_COLUMNS, rows, header, fields)
     return 0
 
 

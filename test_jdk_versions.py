@@ -687,7 +687,7 @@ class ArgumentValidationTests(unittest.TestCase):
 
     def test_removed_and_unknown_flags(self):
         for argv in [("-h",), ("-ea",), ("--early-access",), ("--bogus",), ("--arch",),
-                     ("--os",), ("--count",)]:
+                     ("--os",), ("--count",), ("--fields",)]:
             with self.subTest(argv=argv):
                 self.assert_rejected(*argv)
 
@@ -697,12 +697,206 @@ class ArgumentValidationTests(unittest.TestCase):
                 code, out, _ = run(flag)
                 self.assertEqual(code, 0)
                 for option in ("--auto", "--no-header", "--count", "--version-only", "--os",
-                               "--arch", "--list-os", "--list-arch", "--ea", "--csv", "--json"):
+                               "--arch", "--list-os", "--list-arch", "--ea", "--csv", "--json",
+                               "--fields"):
                     self.assertIn(option, out)
 
     def test_validation_happens_before_any_network_access(self):
         code, _, _ = run("--lts", "--non-lts", fetch=raising(AssertionError("no network!")))
         self.assertEqual(code, 2)
+
+
+class ParseFieldsTests(unittest.TestCase):
+    VALID = ["major", "version", "os", "url"]
+
+    def test_separators_are_equivalent(self):
+        want = ["version", "os", "url"]
+        for raw in (["version,", "os,", "url"],       # --fields version, os, url
+                    ["version,os,url"],               # --fields version,os,url
+                    ["version", "os", "url"],         # --fields version os url
+                    ["version, os, url"],             # --fields "version, os, url"
+                    ["version,os", "url"],            # mixed
+                    ["  version ,  os  ,url  "]):
+            with self.subTest(raw=raw):
+                self.assertEqual(j.parse_fields(raw, self.VALID), want)
+
+    def test_order_is_kept_and_duplicates_dropped(self):
+        self.assertEqual(j.parse_fields(["url,os,url,major,os"], self.VALID), ["url", "os", "major"])
+
+    def test_case_insensitive(self):
+        self.assertEqual(j.parse_fields(["VERSION,Os"], self.VALID), ["version", "os"])
+
+    def test_unknown_fields_are_named_with_the_valid_list(self):
+        with self.assertRaisesRegex(ValueError, r"unknown field 'bogus' \(valid fields: major, version"):
+            j.parse_fields(["version,bogus"], self.VALID)
+        with self.assertRaisesRegex(ValueError, r"unknown fields 'a', 'b'"):
+            j.parse_fields(["a,b"], self.VALID)
+
+    def test_empty_selection(self):
+        for raw in ([","], [" "], [",,"], [""], []):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "no field names"):
+                j.parse_fields(raw, self.VALID)
+
+
+class CellTests(unittest.TestCase):
+    def test_rendering(self):
+        self.assertEqual(j.cell(None), "")
+        self.assertEqual(j.cell(True), "true")
+        self.assertEqual(j.cell(False), "false")
+        self.assertEqual(j.cell(0), "0")
+        self.assertEqual(j.cell(25), "25")
+        self.assertEqual(j.cell("x"), "x")
+
+
+class FieldsTests(unittest.TestCase):
+    BASE = ["--lts", "--os", "linux", "--arch", "x64"]
+
+    def test_the_documented_example_in_every_spelling(self):
+        want = [["version", "os", "url"]] + [
+            [v, "linux", u] for v, u in [("25.0.1+1", "https://example.test/jdk-25/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_1.tar.gz"),
+                                          ("21.0.1+1", "https://example.test/jdk-21/OpenJDK21U-jdk_x64_linux_hotspot_21.0.1_1.tar.gz"),
+                                          ("17.0.1+1", "https://example.test/jdk-17/OpenJDK17U-jdk_x64_linux_hotspot_17.0.1_1.tar.gz"),
+                                          ("8.0.1+1", "https://example.test/jdk-8/OpenJDK8U-jdk_x64_linux_hotspot_8.0.1_1.tar.gz")]]
+        for spelling in (["version,", "os,", "url"], ["version,os,url"], ["version", "os", "url"],
+                         ["version, os, url"]):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(run_csv(*self.BASE, "--fields", *spelling), want)
+
+    def test_only_the_requested_columns_in_the_requested_order(self):
+        rows = run_csv(*self.BASE, "--count", "1", "--fields", "url,major,os")
+        self.assertEqual(rows[0], ["url", "major", "os"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([len(r) for r in rows], [3, 3])
+        self.assertEqual(rows[1][1:], ["25", "linux"])
+
+    def test_single_field_without_header_is_a_plain_list(self):
+        code, out, _ = run(*self.BASE, "--fields", "major", "--csv", "--no-header")
+        self.assertEqual(out, "25\n21\n17\n8\n")
+
+    def test_every_release_field_can_be_selected(self):
+        rows = run_csv("--lts", "--count", "1", "--fields", *j.RELEASE_COLUMNS)
+        self.assertEqual(rows[0], j.RELEASE_COLUMNS)
+        self.assertEqual(rows[1][:7], ["25", "25.0.1+1", "jdk-25.0.1+1", "true",
+                                       "2026-01-25T00:00:00Z", "alpine-linux", "x64"])
+        self.assertTrue(rows[1][8].endswith(".sha256.txt"))
+
+    def test_table_output(self):
+        _, out, _ = run(*self.BASE, "--count", "2", "--fields", "version,os")
+        lines = out.splitlines()
+        self.assertEqual(lines[0], lines[2])
+        self.assertEqual(lines[0], lines[-1])
+        self.assertRegex(lines[1], r"^\| version\s+\| os\s+\|$")
+        self.assertEqual(len(lines), 6)
+        self.assertNotIn("url", out)
+        _, out, _ = run(*self.BASE, "--count", "2", "--fields", "version,os", "--no-header")
+        self.assertEqual(len(out.splitlines()), 4)
+        self.assertNotRegex(out.splitlines()[1], r"^\| version\s+\|")
+
+    def test_sha256_url_is_shown_in_the_table_only_when_asked_for(self):
+        self.assertNotIn("sha256", run("--lts", "--count", "1")[1])
+        _, out, _ = run("--lts", "--count", "1", "--fields", "major,sha256_url")
+        self.assertIn("sha256_url", out)
+        self.assertIn(".sha256.txt", out)
+
+    def test_booleans_render_as_true_false_in_table_and_csv(self):
+        self.assertEqual(run_csv("--lts", "--count", "1", "--fields", "lts")[1], ["true"])
+        self.assertIn("| true", run("--lts", "--count", "1", "--fields", "lts")[1])
+        self.assertEqual(run_csv("--non-lts", "--fields", "lts")[1], ["false"])
+
+    def test_json_is_a_flat_rows_list_with_the_usual_envelope(self):
+        data = run_json(*self.BASE, "--count", "2", "--fields", "version,os,arch")
+        self.assertEqual(list(data), ["source", "arch", "os", "rows"])
+        self.assertEqual((data["source"], data["arch"], data["os"]),
+                         ("Eclipse Temurin (Adoptium API)", "x64", "linux"))
+        self.assertEqual(data["rows"], [
+            {"version": "25.0.1+1", "os": "linux", "arch": "x64"},
+            {"version": "21.0.1+1", "os": "linux", "arch": "x64"}])
+
+    def test_json_keeps_native_types(self):
+        row = run_json("--lts", "--count", "1", "--fields", "major,lts")["rows"][0]
+        self.assertIs(row["lts"], True)
+        self.assertEqual(row["major"], 25)
+
+    def test_json_without_fields_is_unchanged(self):
+        data = run_json("--lts", "--count", "1")
+        self.assertIn("releases", data)
+        self.assertNotIn("rows", data)
+
+    def test_fields_not_selected_can_still_be_used_to_filter(self):
+        rows = run_csv("--lts", "--os", "macos", "--arch", "aarch64", "--fields", "version")
+        self.assertEqual(rows, [["version"], ["25.0.1+1"], ["21.0.1+1"]])
+
+    def test_count_counts_rows_not_fields(self):
+        self.assertEqual(len(run_csv("--fields", "major", "--count", "9")) - 1, 9)
+        self.assertEqual(len(run_csv("--fields", "major,version,os", "--count", "9")) - 1, 9)
+
+    def test_works_with_auto(self):
+        rows = run_csv("--auto", "--lts", "--fields", "major,os,arch", detected=lambda: ("macos", "aarch64"))
+        self.assertEqual(rows, [["major", "os", "arch"], ["25", "macos", "aarch64"],
+                                ["21", "macos", "aarch64"]])
+
+    def test_fields_can_come_before_other_flags(self):
+        self.assertEqual(run_csv("--fields", "version", "os", "--lts", "--os", "linux", "--arch",
+                                 "x64", "--count", "1"),
+                         [["version", "os"], ["25.0.1+1", "linux"]])
+
+    def test_early_access_fields(self):
+        rows = run_csv("--ea", "--os", "linux", "--arch", "x64", "--fields", "build,released,url")
+        self.assertEqual(rows, [["build", "released", "url"],
+                                ["21", "2026-10-22", "https://download.java.net/java/early_access/"
+                                 "jdk28/21/GPL/openjdk-28-ea+21_linux-x64_bin.tar.gz"]])
+        data = run_json("--ea", "--fields", "version,os", "--arch", "aarch64")
+        self.assertEqual(data["rows"], [{"version": "28-ea+21", "os": "linux"},
+                                        {"version": "28-ea+21", "os": "macos"}])
+
+    def test_list_commands(self):
+        self.assertEqual(run_csv("--list-arch", "--fields", "arch", "--count", "2"),
+                         [["arch"], ["x64"], ["x32"]])
+        self.assertEqual(run_json("--list-os", "--fields", "os", "--count", "1")["rows"],
+                         [{"os": "linux"}])
+
+    def test_fields_valid_for_one_mode_are_rejected_in_another(self):
+        for argv in [("--lts", "--fields", "build"),            # build is early-access only
+                     ("--ea", "--fields", "release_name"),      # release_name is GA only
+                     ("--ea", "--fields", "lts"),
+                     ("--list-os", "--fields", "arch"),
+                     ("--list-arch", "--fields", "os"),
+                     ("--list-arch", "--fields", "version")]:
+            with self.subTest(argv=argv):
+                code, out, err = run(*argv)
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("unknown field", err)
+
+    def test_unknown_field_error_lists_the_valid_fields(self):
+        code, _, err = run("--fields", "version,bogus")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown field 'bogus'", err)
+        self.assertIn("valid fields: major, version, release_name, lts", err)
+
+    def test_empty_selection_is_rejected(self):
+        for argv in [("--fields", ","), ("--fields", " ")]:
+            with self.subTest(argv=argv):
+                code, _, err = run(*argv)
+                self.assertEqual(code, 2)
+                self.assertIn("no field names given", err)
+
+    def test_not_allowed_with_version_only(self):
+        code, out, err = run("--fields", "os", "--version-only")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--fields: not allowed with --version-only", err)
+
+    def test_validation_happens_before_any_network_access(self):
+        code, _, _ = run("--fields", "bogus", fetch=raising(AssertionError("no network!")))
+        self.assertEqual(code, 2)
+
+    def test_no_match_is_still_an_error_with_fields(self):
+        code, out, err = run("--os", "solaris", "--fields", "version")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("solaris", err)
+
+    def test_default_output_is_unchanged_when_fields_is_not_used(self):
+        self.assertEqual(run_csv("--lts", "--count", "1")[0], j.RELEASE_COLUMNS)
+        self.assertEqual(run_csv("--ea", "--count", "1")[0], j.EA_COLUMNS)
 
 
 class NetworkFailureTests(unittest.TestCase):
