@@ -44,6 +44,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -213,7 +214,7 @@ def cell(value):
     return str(value)
 
 
-BOLD, DIM, GREEN, YELLOW, BLUE, CYAN = "1", "2", "32", "33", "34", "36"
+BOLD, DIM, RED, GREEN, YELLOW, BLUE, CYAN = "1", "2", "31", "32", "33", "34", "36"
 
 # Colors that group rows in the table. Each OS and architecture has a fixed color, so "linux" or
 # "aarch64" looks the same in every run. Majors get the next color from MAJOR_COLORS in the order
@@ -668,16 +669,22 @@ def download_all(rows, directory, show_bar=False, installer=None, force=False):
                     download_failures += 1
                     continue
                 if file_matches_sha256(archive, expected):
-                    print(f"skipping {name} (already up to date)", file=sys.stderr)
                     skipped += 1
                     if installer:
                         try:
-                            print(f"installed {installer(archive, row)}", file=sys.stderr)
-                            installed += 1
+                            dest = installer(archive, row)
+                            if dest is not None:
+                                print(f"reinstalled {dest} (archive was already up to date)",
+                                      file=sys.stderr)
+                                installed += 1
+                            else:
+                                print(f"skipping {name} (already up to date)", file=sys.stderr)
                         except INSTALL_ERRORS as exc:
                             print(json.dumps({"error": f"failed to install {name}: {exc}"}),
                                   file=sys.stderr)
                             install_failures += 1
+                    else:
+                        print(f"skipping {name} (already up to date)", file=sys.stderr)
                     continue
             make_progress = None
             if show_bar:
@@ -692,8 +699,10 @@ def download_all(rows, directory, show_bar=False, installer=None, force=False):
             continue
         if installer:
             try:
-                print(f"installed {installer(archive, row)}", file=sys.stderr)
-                installed += 1
+                dest = installer(archive, row)
+                if dest is not None:
+                    print(f"installed {dest}", file=sys.stderr)
+                    installed += 1
             except INSTALL_ERRORS as exc:
                 print(json.dumps({"error": f"failed to install {name}: {exc}"}), file=sys.stderr)
                 install_failures += 1
@@ -773,20 +782,77 @@ def latest_for_major(major, lts_majors):
     }
 
 
+def verify_jdk(dest, color=False):
+    """Run java -version and javac -version from dest/bin, printing output to stderr.
+
+    Returns True if both commands succeed, False otherwise.
+    color=True applies ANSI colors: cyan for the command label, yellow for the version output,
+    and bold red for errors.
+    """
+    ok = True
+    java_exe = os.path.join(dest, "bin", "java.exe" if sys.platform == "win32" else "java")
+    javac_exe = os.path.join(dest, "bin", "javac.exe" if sys.platform == "win32" else "javac")
+    for exe in (java_exe, javac_exe):
+        name = os.path.basename(exe).removesuffix(".exe")
+        try:
+            result = subprocess.run(
+                [exe, "-version"], capture_output=True, text=True, timeout=15,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                print(json.dumps({"error": f"'{name} -version' failed: {output}"}),
+                      file=sys.stderr)
+                ok = False
+            else:
+                label = style(f"{name} -version:", CYAN) if color else f"{name} -version:"
+                value = style(output, YELLOW) if color else output
+                print(f"{label} {value}", file=sys.stderr)
+        except OSError as exc:
+            print(json.dumps({"error": f"could not run '{name}': {exc}"}), file=sys.stderr)
+            ok = False
+    return ok
+
+
 def finish_downloads(rows, args, show_bar):
     """Run --download (and --install, if given) for the listed rows; return the exit code."""
     if not args.download:
         return 0
     installer = None
+    verify_failures = [0]  # list so the closure can mutate it
     if args.install:
         conflict = install_conflict(rows)
         if conflict:
             print(json.dumps({"error": conflict}), file=sys.stderr)
             return 1
 
+        color = use_color(sys.stderr)
+
         def installer(archive, row):
-            return install_jdk(archive, row["major"], args.prefix_dir, args.install_prefix)
-    return download_all(rows, args.target_directory, show_bar, installer, force=args.force)
+            dest = os.path.join(args.prefix_dir, f"{args.install_prefix}{row['major']}")
+            if not args.force and has_java(dest):
+                msg = f"skipping install of JDK {row['major']} ({dest} already exists)"
+                print(style(msg, DIM) if color else msg, file=sys.stderr)
+                # Return None so download_all does not print "installed <dest>" for a skip.
+                result = None
+            else:
+                if os.path.isdir(dest):
+                    msg = (f"reinstalling JDK {row['major']} "
+                           f"({dest} exists but bin/java is missing)")
+                    print(style(msg, YELLOW) if color else msg, file=sys.stderr)
+                dest = install_jdk(archive, row["major"], args.prefix_dir, args.install_prefix)
+                result = dest
+            if args.verify_installed:
+                header = f"verifying JDK {row['major']} at {dest}"
+                print(style(header, BOLD, CYAN) if color else header, file=sys.stderr)
+                if not verify_jdk(dest, color=color):
+                    if color:
+                        print(style(f"verification failed for JDK {row['major']}", BOLD, RED),
+                              file=sys.stderr)
+                    verify_failures[0] += 1
+            return result
+
+    code = download_all(rows, args.target_directory, show_bar, installer, force=args.force)
+    return 1 if code or verify_failures[0] else 0
 
 
 def main():
@@ -879,8 +945,14 @@ def main():
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="re-download a file even if the local copy already matches the remote SHA-256 "
-             "checksum (default: skip files that are already up to date)",
+        help="re-download and re-install even if the local archive already matches the remote "
+             "SHA-256 checksum and the install directory already exists "
+             "(default: skip files and installs that are already up to date)",
+    )
+    parser.add_argument(
+        "--verify-installed", action="store_true",
+        help="after each successful --install, run java -version and javac -version from the "
+             "installed JDK to confirm it works. Output goes to stderr",
     )
     parser.add_argument(
         "--plain", action="store_true",

@@ -2344,9 +2344,18 @@ class InstallFlagTests(TempDirTestCase):
     def test_installing_over_an_older_install_replaces_it(self):
         self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
         self.write("java/jdk25/OLD", b"x")
-        code, _, err = self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+        code, _, err = self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1", "--force")
         self.assertEqual(code, 0, err)
         self.assertFalse(os.path.exists(self.path("java", "jdk25", "OLD")))
+
+    def test_skips_install_if_already_installed(self):
+        self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+        self.write("java/jdk25/OLD", b"x")
+        code, _, err = self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("skipping install of JDK 25", err)
+        self.assertTrue(os.path.exists(self.path("java", "jdk25", "OLD")),
+                        "existing install must be untouched when skipped")
 
     def test_works_for_early_access_builds(self):
         code, _, err = self.go("--ea", "--os", "linux", "--arch", "x64")
