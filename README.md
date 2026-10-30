@@ -5,15 +5,32 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 [![License: BSD 2-Clause](https://img.shields.io/badge/license-BSD%202--Clause-blue)](LICENSE)
 
-A command-line tool that reports the most recent released JDK versions, with download links, as a
-table, JSON or CSV.
+A single-file Python tool for looking up, downloading and installing Eclipse Temurin JDKs. It
+needs no dependencies beyond the Python standard library.
 
-- **GA releases** come from the [Adoptium API](https://api.adoptium.net) (Eclipse Temurin builds).
-- **Early-access builds** come from [jdk.java.net](https://jdk.java.net), the OpenJDK site that
-  Oracle leads.
+**What it can do:**
 
-It uses only the Python standard library, so there is nothing to install. It was developed and
-tested on Python 3.14.
+- **List** the latest GA and early-access JDK releases as a table, JSON or CSV, filtered by
+  version, OS, architecture or major version.
+- **Download** any listed release into a directory of your choice, verifying each file against its
+  published SHA-256 checksum. Already-downloaded files that are still current are skipped
+  automatically; use `--force` to re-download regardless.
+- **Install** a downloaded JDK with a single flag (`--install` implies `--download`). Each major
+  version is unpacked into its own directory — `--prefix-dir /opt/java --install-prefix jdk` gives
+  `/opt/java/jdk21`, `/opt/java/jdk25` and so on, with `bin/java` directly inside. An existing
+  install is skipped unless the directory is broken or `--force` is given. If the directory exists
+  but `bin/java` is missing the JDK is reinstalled automatically from the cached archive.
+- **Verify** each installed JDK immediately after installation with `--verify-installed`, which runs
+  `java -version` and `javac -version` and reports the result in colour.
+- **Detect** this machine's OS and architecture with `--auto`, so the same command works unchanged
+  on Linux, macOS and Windows across x64 and aarch64.
+
+**Data sources:**
+
+- GA releases: [Adoptium API](https://api.adoptium.net) (Eclipse Temurin builds).
+- Early-access builds: [jdk.java.net](https://jdk.java.net) (Oracle-led OpenJDK).
+
+Requires Python 3.11 or later. Uses only the standard library — nothing to install.
 
 ## Contents
 
@@ -40,6 +57,9 @@ tested on Python 3.14.
 ```
 python3 jdk_versions.py                  # LTS releases plus the latest feature release, as a table
 python3 jdk_versions.py --auto           # the same, limited to downloads for this machine
+python3 jdk_versions.py --auto --lts --count 1 --download   # download the newest LTS for this machine
+python3 jdk_versions.py --auto --lts --count 1 \
+    --install --prefix-dir /opt/java --install-prefix jdk   # download + install
 python3 jdk_versions.py --h              # list every option
 ```
 
@@ -188,7 +208,8 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--install` | Downloads (implies `--download`) and unpacks each JDK into `--prefix-dir`. See [Installing JDKs](#installing-jdks). |
 | `--prefix-dir DIR` | The directory `--install` installs into. It is created if it does not exist. |
 | `--install-prefix PREFIX` | The start of each install directory's name. The major version is added to it, so `jdk` gives `jdk27`. |
-| `--force` | Re-downloads a file even if the local copy already matches the remote SHA-256 checksum. By default already-up-to-date files are skipped. |
+| `--force` | Re-downloads and re-installs even if the local archive already matches the remote SHA-256 checksum and the install directory already exists. |
+| `--verify-installed` | After each `--install`, immediately runs `java -version` and `javac -version` from the installed JDK and prints the result. Output is coloured on a terminal (cyan labels, yellow version strings, bold red on failure). Requires `--install`. |
 | `--plain` | Turns off the colors and the download progress bar. See [Colors and the progress bar](#colors-and-the-progress-bar). |
 | `--h`, `--help` | Shows the help text. Note that `-h` is not accepted. |
 
@@ -206,6 +227,7 @@ Rules for combining options:
   `--target-directory` defaults to `.` as usual. `--prefix-dir` and `--install-prefix` cannot be
   used without `--install`.
 - `--force` only has an effect when `--download` or `--install` is also given.
+- `--verify-installed` requires `--install`.
 - `--count` must be a whole number of 1 or more.
 - Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--download`, `--install`,
   `--plain` and the output formats work with `--ea` too.
@@ -355,8 +377,15 @@ python3 jdk_versions.py --auto --non-lts --count 1 \
 ```
 
 If the newest feature release is JDK 27, that installs it as `/java/jdk27`. With `--lts --count 2`
-you would get `/java/jdk25` and `/java/jdk21`. Running the same command again skips the download if
-the archive is already up to date, then re-installs from the cached archive.
+you would get `/java/jdk25` and `/java/jdk21`.
+
+Add `--verify-installed` to confirm each JDK works immediately after it is installed:
+
+```
+python3 jdk_versions.py --auto --lts --count 1 \
+    --install --target-directory ~/dl --prefix-dir /java --install-prefix jdk \
+    --verify-installed
+```
 
 - **The JDK sits directly in that directory.** `/java/jdk27/bin/java`, `/java/jdk27/lib` and so on.
   There is no `jdk-27.0.1+1` directory inside it, and on macOS the `Contents/Home` wrapper is
@@ -365,10 +394,19 @@ the archive is already up to date, then re-installs from the cached archive.
   example Linux and macOS builds of JDK 25) would need the same directory. The script refuses that
   before downloading anything, exits with code 1, and tells you to narrow the selection with
   `--os`, `--arch` or `--auto`.
-- **An existing JDK is replaced.** The old copy is set aside while the new one moves into place
-  and is restored if that fails. A directory that does not look like a JDK (no `bin/java` and no
-  `release` file), a plain file or a symbolic link is never replaced. That install fails instead
-  and nothing is deleted.
+- **Re-running is safe and efficient.** The archive is only re-downloaded if the remote checksum
+  has changed. If the install directory already has a working `bin/java` the install step is also
+  skipped. If the directory exists but `bin/java` is missing the JDK is reinstalled from the
+  cached archive automatically, with a warning. Use `--force` to re-download and reinstall
+  unconditionally.
+- **`--verify-installed` runs `java -version` and `javac -version`** from the installed `bin/`
+  immediately after each install or reinstall — not deferred to the end. Output is printed to
+  stderr in colour on a terminal (cyan command labels, yellow version strings, bold red on
+  failure). A verification failure exits with code 1.
+- **An existing JDK is replaced atomically.** The old copy is set aside while the new one moves
+  into place and is restored if that fails. A directory that does not look like a JDK (no `bin/java`
+  and no `release` file), a plain file or a symbolic link is never replaced; that install fails and
+  nothing is deleted.
 - **The prefix may contain letters, digits, `.`, `_`, `+` and `-`.** It cannot contain a path
   separator, so installs always land directly under `--prefix-dir`. An empty prefix is allowed and
   gives `/java/27`.
@@ -380,9 +418,8 @@ the archive is already up to date, then re-installs from the cached archive.
   one JSON error for it on stderr and exits with code 1.
 - Each success prints `installed <path>` on stderr, and the summary line reports
   `installed N of M JDK(s)`. The listing on stdout is unchanged.
-- Unpacking uses the tar extraction filters in Python's `tarfile` module, which need Python 3.9.17,
-  3.10.12, 3.11.4 or later. The script supports 3.11 and newer. A Python without them reports an
-  install error instead of unpacking without protection.
+- Unpacking requires Python 3.11.4 or later for the tar extraction filters in the `tarfile` module.
+  A Python without them reports an install error instead of unpacking without protection.
 
 ## Colors and the progress bar
 
