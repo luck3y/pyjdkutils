@@ -12,7 +12,8 @@ Usage:
     python3 jdk_versions.py --arch x64                                         # only x64 downloads (works with all modes)
     python3 jdk_versions.py --auto                                             # only downloads for this machine's OS and architecture
     python3 jdk_versions.py --auto --lts --count 1                             # newest LTS download for this machine
-    python3 jdk_versions.py --auto --lts --download --target-directory jdks    # download the listed files
+    python3 jdk_versions.py --auto --lts --download                                   # download the listed files to the current directory
+    python3 jdk_versions.py --auto --lts --download --target-directory jdks            # download the listed files to jdks/
     python3 jdk_versions.py --auto --lts --download --target-directory jdks --force   # re-download even if already up to date
     python3 jdk_versions.py --auto --lts --install --target-directory jdks --prefix-dir /java --install-prefix jdk   # download + install as /java/jdk25, /java/jdk21, ...
     python3 jdk_versions.py --count 3                                          # only the first 3 rows (works with all modes)
@@ -846,8 +847,9 @@ def main():
              "by --install",
     )
     parser.add_argument(
-        "--target-directory", metavar="DIR",
-        help="the directory --download saves files in (created if it does not exist)",
+        "--target-directory", metavar="DIR", default=".",
+        help="the directory --download saves files in (created if it does not exist); "
+             "defaults to the current directory",
     )
     parser.add_argument(
         "--install", action="store_true",
@@ -888,9 +890,7 @@ def main():
         parser.error("argument --auto: not allowed with --list-arch or --list-os")
     if args.install and not args.download:
         args.download = True
-    if args.download and args.target_directory is None:
-        parser.error("argument --download/--install: requires --target-directory")
-    if args.target_directory is not None and not args.download:
+    if args.target_directory != "." and not args.download:
         parser.error("argument --target-directory: requires --download")
     if args.download and (args.list_arch or args.list_os or args.version_only):
         parser.error("argument --download: not allowed with --list-arch, --list-os or "

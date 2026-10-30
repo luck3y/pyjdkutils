@@ -1195,9 +1195,6 @@ class DownloadArgumentTests(unittest.TestCase):
         self.assertEqual(code, 2, f"{argv} should be rejected (stderr: {err})")
         self.assertEqual(out, "")
 
-    def test_download_needs_a_target_directory(self):
-        self.assert_rejected("--lts", "--download")
-
     def test_target_directory_needs_download(self):
         self.assert_rejected("--lts", "--target-directory", "x")
 
@@ -2393,8 +2390,7 @@ class InstallArgumentTests(unittest.TestCase):
         self.assertEqual(code, 2, f"{argv} should be rejected (stderr: {err})")
         self.assertEqual(out, "")
 
-    def test_install_needs_download_prefix_dir_and_install_prefix(self):
-        self.assert_rejected("--lts", "--install", "--prefix-dir", "p", "--install-prefix", "jdk")
+    def test_install_needs_prefix_dir_and_install_prefix(self):
         self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",
                              "--install-prefix", "jdk")
         self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",

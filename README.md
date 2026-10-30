@@ -177,8 +177,8 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--csv` | Prints CSV instead of a table. |
 | `--no-header` | Leaves out the header row in table and CSV output. JSON is unaffected. |
 | `--fields FIELD ...` | Outputs only these fields, in this order. See [Choosing fields](#choosing-fields). |
-| `--download` | Downloads every listed result into `--target-directory`. See [Downloading files](#downloading-files). |
-| `--target-directory DIR` | The directory `--download` saves files in. It is created if it does not exist. |
+| `--download` | Downloads every listed result into `--target-directory` (default: current directory). See [Downloading files](#downloading-files). |
+| `--target-directory DIR` | The directory `--download` saves files in (default: `.`). It is created if it does not exist. |
 | `--install` | Downloads (implies `--download`) and unpacks each JDK into `--prefix-dir`. See [Installing JDKs](#installing-jdks). |
 | `--prefix-dir DIR` | The directory `--install` installs into. It is created if it does not exist. |
 | `--install-prefix PREFIX` | The start of each install directory's name. The major version is added to it, so `jdk` gives `jdk27`. |
@@ -192,10 +192,12 @@ Rules for combining options:
 - `--json` and `--csv` are mutually exclusive.
 - `--auto` and `--version-only` cannot be used with `--list-arch` or `--list-os`.
 - `--fields` cannot be used with `--version-only`.
-- `--download` and `--target-directory` must be used together. `--download` cannot be used with
-  `--version-only`, `--list-arch` or `--list-os`.
-- `--install` implies `--download`. It requires `--target-directory`, `--prefix-dir` and
-  `--install-prefix`. `--prefix-dir` and `--install-prefix` cannot be used without `--install`.
+- `--target-directory` without `--download` is an error. `--download` without `--target-directory`
+  saves to the current directory. `--download` cannot be used with `--version-only`, `--list-arch`
+  or `--list-os`.
+- `--install` implies `--download`. It requires `--prefix-dir` and `--install-prefix`;
+  `--target-directory` defaults to `.` as usual. `--prefix-dir` and `--install-prefix` cannot be
+  used without `--install`.
 - `--force` only has an effect when `--download` or `--install` is also given.
 - `--count` must be a whole number of 1 or more.
 - Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--download`, `--install`,
@@ -305,11 +307,12 @@ python3 jdk_versions.py --ea --fields version build url --json
 
 ## Downloading files
 
-`--download` saves every result in the listing to the directory named by `--target-directory`.
-What gets downloaded is exactly what would be listed, so `--lts`, `--os`, `--arch`, `--auto` and
-`--count` choose the files.
+`--download` saves every result in the listing to the directory named by `--target-directory`
+(default: the current directory). What gets downloaded is exactly what would be listed, so `--lts`,
+`--os`, `--arch`, `--auto` and `--count` choose the files.
 
 ```
+python3 jdk_versions.py --auto --lts --count 1 --download
 python3 jdk_versions.py --auto --lts --count 1 --download --target-directory ~/jdks
 python3 jdk_versions.py --lts --os linux --arch x64 --download --target-directory jdks
 python3 jdk_versions.py --ea --os windows --arch x64 --download --target-directory ea
@@ -331,8 +334,8 @@ python3 jdk_versions.py --ea --os windows --arch x64 --download --target-directo
 - Downloads use HTTPS only, with a 20 second timeout on each connection and no retries. The files
   are large, often 100 MB or more, so check how many rows you are asking for. `--count` limits
   them.
-- `--download` requires `--target-directory`, and the reverse. Without `--download`, nothing is
-  written to disk.
+- `--target-directory` defaults to the current directory when `--download` is given without it.
+  Without `--download`, `--target-directory` is an error. Without either, nothing is written to disk.
 
 ## Installing JDKs
 
@@ -486,7 +489,7 @@ error. Pass `--os` and `--arch` yourself in that case.
 |---|---|
 | `0` | Success. |
 | `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, the jdk.java.net page layout changed, a `--download` failed (an unusable target directory, a network error or a checksum mismatch), or an `--install` failed (an archive that is not a JDK, an unusable `--prefix-dir`, or two downloads for one major version). |
-| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name, `--download` without `--target-directory`, or `--install` without `--target-directory`, `--prefix-dir` or `--install-prefix`. |
+| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name, `--target-directory` without `--download`, or `--install` without `--prefix-dir` or `--install-prefix`. |
 
 Runtime failures print a JSON object on **stderr**, and nothing on stdout:
 
