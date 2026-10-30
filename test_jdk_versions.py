@@ -1157,8 +1157,8 @@ class DownloadTests(unittest.TestCase):
             code, out, err = self.go(*self.BASE, "--count", "1")
         self.assertEqual(code, 1)
         self.assertIn("cannot use target directory", err)
-        self.assertEqual(json.loads(err.strip())["error"].split(":")[0],
-                         f"cannot use target directory '{self.dir}'")
+        self.assertIn(f"cannot use target directory '{self.dir}'",
+                      json.loads(err.strip())["error"])
 
     def test_an_existing_directory_is_reused(self):
         os.makedirs(self.dir)
@@ -1887,11 +1887,11 @@ class TempDirTestCase(unittest.TestCase):
         return self.path(root)
 
     def tree(self, root):
-        """Every file and directory under root, as sorted relative paths."""
+        """Every file and directory under root, as sorted relative paths (forward slashes)."""
         found = []
         for base, dirs, names in os.walk(root):
             for n in dirs + names:
-                found.append(os.path.relpath(os.path.join(base, n), root))
+                found.append(os.path.relpath(os.path.join(base, n), root).replace(os.sep, "/"))
         return sorted(found)
 
 
@@ -2019,9 +2019,14 @@ class UnpackTests(TempDirTestCase):
         self.assertFalse(os.path.exists(self.path("escaped.txt")))
 
     def test_a_tar_cannot_use_an_absolute_path(self):
+        # Python 3.11 data_filter raises AbsolutePathError on absolute paths; later versions strip
+        # them silently.  Either way the file must not be written to the absolute path.
         target = self.path("abs.txt")
         data = build_tar({target: b"x"})
-        j.unpack(self.archive("abs.tar.gz", data), self.path("out"))
+        try:
+            j.unpack(self.archive("abs.tar.gz", data), self.path("out"))
+        except tarfile.TarError:
+            pass
         self.assertFalse(os.path.exists(target), "an absolute path must not be honored")
 
     @unittest.skipUnless(os.name == "posix", "needs symlinks")
