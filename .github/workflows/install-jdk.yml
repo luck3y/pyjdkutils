@@ -1,8 +1,8 @@
 name: Install latest non-LTS JDK
 
 # Installs the newest non-LTS Temurin JDK that matches the runner's own OS and architecture, using
-# this repository's jdk_versions.py (--auto detects the host, --download fetches and verifies the
-# archive), then checks that it runs.
+# this repository's jdk_versions.py (--auto detects the host, --install implies --download and
+# fetches, verifies and unpacks the archive in one step), then checks that it runs.
 
 on:
   push:
@@ -46,39 +46,26 @@ jobs:
         with:
           python-version: "3.14"
 
-      # --auto picks this runner's OS and architecture. --download saves the file and checks it
-      # against its published SHA-256 checksum, and the step fails if the download or the check
-      # fails. The directory starts empty, so the one file in it afterwards is the archive.
-      - name: Download and verify the latest non-LTS JDK for this machine
+      # --auto picks this runner's OS and architecture. --install implies --download (fetches and
+      # verifies the archive against its published SHA-256 checksum) and then unpacks it into
+      # --prefix-dir. The installed path printed to stderr is captured and used to set JAVA_HOME.
+      - name: Download, verify and install the latest non-LTS JDK for this machine
         run: |
           set -euo pipefail
           DOWNLOAD_DIR="$RUNNER_TEMP/jdk-download"
-          if command -v cygpath >/dev/null; then DOWNLOAD_DIR=$(cygpath -m "$RUNNER_TEMP")/jdk-download; fi
-          python jdk_versions.py --auto --non-lts --count 1 --download --target-directory "$DOWNLOAD_DIR"
-          set -- "$DOWNLOAD_DIR"/*
-          [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "expected exactly one downloaded file in $DOWNLOAD_DIR" >&2; exit 1; }
-          echo "ARCHIVE=$1" >> "$GITHUB_ENV"
-          echo "Downloaded $1"
-
-      - name: Install the JDK
-        run: |
-          set -euo pipefail
-          DEST="$RUNNER_TEMP/jdk"
-          if command -v cygpath >/dev/null; then DEST=$(cygpath -m "$RUNNER_TEMP")/jdk; fi
-          mkdir -p "$DEST"
-          case "$ARCHIVE" in
-            *.zip)    python -m zipfile -e "$ARCHIVE" "$DEST" ;;
-            *.tar.gz) tar -xzf "$ARCHIVE" -C "$DEST" ;;
-            *) echo "unexpected archive type: $ARCHIVE" >&2; exit 1 ;;
-          esac
-          # The archive holds one directory. On macOS the JDK is in Contents/Home inside it.
-          TOP=$(echo "$DEST"/*/)
-          if [ -d "${TOP}Contents/Home" ]; then JAVA_HOME_DIR="${TOP}Contents/Home"; else JAVA_HOME_DIR="$TOP"; fi
-          JAVA_HOME_DIR=$(cd "$JAVA_HOME_DIR" && pwd)
+          PREFIX_DIR="$RUNNER_TEMP/jdk-install"
+          if command -v cygpath >/dev/null; then
+            DOWNLOAD_DIR=$(cygpath -m "$RUNNER_TEMP")/jdk-download
+            PREFIX_DIR=$(cygpath -m "$RUNNER_TEMP")/jdk-install
+          fi
+          INSTALL_OUT=$(python jdk_versions.py --auto --non-lts --count 1 \
+            --install --target-directory "$DOWNLOAD_DIR" \
+            --prefix-dir "$PREFIX_DIR" --install-prefix jdk \
+            2>&1 | tee /dev/stderr | grep '^installed ' | sed 's/^installed //')
+          JAVA_HOME_DIR=$(cd "$INSTALL_OUT" && pwd)
           if command -v cygpath >/dev/null; then JAVA_HOME_DIR=$(cygpath -w "$JAVA_HOME_DIR"); fi
           echo "JAVA_HOME=$JAVA_HOME_DIR" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_DIR/bin" >> "$GITHUB_PATH"
-          echo "Installed to $JAVA_HOME_DIR"
 
       - name: Check the installed JDK
         run: |
