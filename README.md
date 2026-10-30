@@ -22,6 +22,7 @@ tested on Python 3.14.
 - [Output formats](#output-formats)
   - [Choosing fields](#choosing-fields)
 - [Downloading files](#downloading-files)
+- [Installing JDKs](#installing-jdks)
 - [Colors and the progress bar](#colors-and-the-progress-bar)
 - [How filtering and `--count` work](#how-filtering-and---count-work)
 - [Platform names](#platform-names)
@@ -200,6 +201,9 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--fields FIELD ...` | Outputs only these fields, in this order. See [Choosing fields](#choosing-fields). |
 | `--download` | Downloads every listed result into `--target-directory`. See [Downloading files](#downloading-files). |
 | `--target-directory DIR` | The directory `--download` saves files in. It is created if it does not exist. |
+| `--install` | Unpacks each downloaded JDK into `--prefix-dir`. See [Installing JDKs](#installing-jdks). |
+| `--prefix-dir DIR` | The directory `--install` installs into. It is created if it does not exist. |
+| `--install-prefix PREFIX` | The start of each install directory's name. The major version is added to it, so `jdk` gives `jdk27`. |
 | `--plain` | Turns off the colors and the download progress bar. See [Colors and the progress bar](#colors-and-the-progress-bar). |
 | `--h`, `--help` | Shows the help text. Note that `-h` is not accepted. |
 
@@ -211,9 +215,11 @@ Rules for combining options:
 - `--fields` cannot be used with `--version-only`.
 - `--download` and `--target-directory` must be used together. `--download` cannot be used with
   `--version-only`, `--list-arch` or `--list-os`.
+- `--install` requires `--download`, `--prefix-dir` and `--install-prefix`. `--prefix-dir` and
+  `--install-prefix` cannot be used without `--install`.
 - `--count` must be a whole number of 1 or more.
-- Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--download`, `--plain`
-  and the output formats work with `--ea` too.
+- Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--download`, `--install`,
+  `--plain` and the output formats work with `--ea` too.
 - The long flags can be shortened as long as the prefix is unambiguous (argparse behavior).
 
 ## Output formats
@@ -345,6 +351,45 @@ python3 jdk_versions.py --ea --os windows --arch x64 --download --target-directo
 - `--download` requires `--target-directory`, and the reverse. Without `--download`, nothing is
   written to disk.
 
+## Installing JDKs
+
+`--install` unpacks every JDK that `--download` has fetched and verified. Each one goes into its
+own directory under `--prefix-dir`, named `--install-prefix` followed by the major version.
+
+```
+python3 jdk_versions.py --auto --non-lts --count 1 --download --target-directory ~/dl \
+    --install --prefix-dir /java --install-prefix jdk
+```
+
+If the newest feature release is JDK 27, that installs it as `/java/jdk27`. With `--lts --count 2`
+you would get `/java/jdk25` and `/java/jdk21`.
+
+- **The JDK sits directly in that directory.** `/java/jdk27/bin/java`, `/java/jdk27/lib` and so on.
+  There is no `jdk-27.0.1+1` directory inside it, and on macOS the `Contents/Home` wrapper is
+  removed, so `JAVA_HOME=/java/jdk27` works on every platform.
+- **Each major version needs exactly one download.** Two downloads for the same major (for
+  example Linux and macOS builds of JDK 25) would need the same directory. The script refuses that
+  before downloading anything, exits with code 1, and tells you to narrow the selection with
+  `--os`, `--arch` or `--auto`.
+- **An existing JDK is replaced.** The old copy is set aside while the new one moves into place
+  and is restored if that fails. A directory that does not look like a JDK (no `bin/java` and no
+  `release` file), a plain file or a symbolic link is never replaced. That install fails instead
+  and nothing is deleted.
+- **The prefix may contain letters, digits, `.`, `_`, `+` and `-`.** It cannot contain a path
+  separator, so installs always land directly under `--prefix-dir`. An empty prefix is allowed and
+  gives `/java/27`.
+- **The archives stay in `--target-directory`.** Delete them when you no longer need them.
+- **Archives are unpacked safely.** Files that would land outside the install directory, and links
+  pointing outside it, are rejected. Links inside the JDK are kept. The JDK is unpacked in a
+  temporary directory inside `--prefix-dir` first, so a failed install leaves no partial JDK.
+- **Failures are per JDK.** A JDK that fails to install does not stop the others. The script prints
+  one JSON error for it on stderr and exits with code 1.
+- Each success prints `installed <path>` on stderr, and the summary line reports
+  `installed N of M JDK(s)`. The listing on stdout is unchanged.
+- Unpacking uses the tar extraction filters in Python's `tarfile` module, which need Python 3.9.17,
+  3.10.12, 3.11.4 or later. The script supports 3.11 and newer. A Python without them reports an
+  install error instead of unpacking without protection.
+
 ## Colors and the progress bar
 
 On a terminal, the table is colored and downloads show a progress bar:
@@ -456,8 +501,8 @@ error. Pass `--os` and `--arch` yourself in that case.
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, the jdk.java.net page layout changed, or a `--download` failed (an unusable target directory, a network error or a checksum mismatch). |
-| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name or `--download` without `--target-directory`. |
+| `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, the jdk.java.net page layout changed, a `--download` failed (an unusable target directory, a network error or a checksum mismatch), or an `--install` failed (an archive that is not a JDK, an unusable `--prefix-dir`, or two downloads for one major version). |
+| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name `--download` without `--target-directory`, or `--install` without `--download`, `--prefix-dir` or `--install-prefix`. |
 
 Runtime failures print a JSON object on **stderr**, and nothing on stdout:
 
@@ -499,7 +544,7 @@ python3 -m unittest -v test_jdk_versions
 
 The tests are in [`test_jdk_versions.py`](test_jdk_versions.py). They use no network access: the
 network layer is replaced with canned responses. They cover every option, the output formats,
-platform detection, the early-access scraper, invalid combinations and network failures.
+platform detection, downloads, installing from real tar and zip layouts, the early-access scraper, invalid combinations and network failures.
 
 GitHub Actions runs them on every push to `main` and on every pull request, on Python 3.11 to 3.15
 on each of Linux, macOS (Apple Silicon) and Windows. See

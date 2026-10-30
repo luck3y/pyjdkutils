@@ -13,6 +13,7 @@ Usage:
     python3 jdk_versions.py --auto                            # only downloads for this machine's OS and architecture
     python3 jdk_versions.py --auto --lts --count 1            # newest LTS download for this machine
     python3 jdk_versions.py --auto --lts --download --target-directory jdks   # download the listed files
+    python3 jdk_versions.py --auto --lts --download --target-directory jdks --install --prefix-dir /java --install-prefix jdk   # also install them as /java/jdk25, /java/jdk21, ...
     python3 jdk_versions.py --count 3                         # only the first 3 rows (works with all modes)
     python3 jdk_versions.py --csv                             # CSV output (works with all modes)
     python3 jdk_versions.py --ea                              # most recent early-access build
@@ -38,10 +39,15 @@ import json
 import os
 import platform
 import re
+import shutil
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.parse
 import urllib.request
+import zipfile
+import zlib
 
 API = "https://api.adoptium.net/v3"
 EA_SITE = "https://jdk.java.net"
@@ -54,6 +60,10 @@ BAR_INTERVAL = 0.1  # seconds between redraws of the progress bar
 # timeouts, connection resets/refusals, broken pipes and TLS failures; HTTPException covers
 # protocol-level failures such as IncompleteRead and a server closing the connection early.
 NETWORK_ERRORS = (OSError, http.client.HTTPException)
+
+# Everything that can go wrong while unpacking and installing a downloaded archive: a full disk or
+# missing permissions (OSError), a corrupt gzip, tar or zip file, or an archive that is not a JDK.
+INSTALL_ERRORS = (OSError, ValueError, tarfile.TarError, zipfile.BadZipFile, EOFError, zlib.error)
 
 # Common alternate spellings mapped to the architecture names used by the data sources.
 ARCH_ALIASES = {"amd64": "x64", "x86_64": "x64", "x86-64": "x64", "arm64": "aarch64"}
@@ -496,12 +506,125 @@ def download_verified(url, sha256_url, dest, make_progress=None):
         raise
 
 
-def download_all(rows, directory, show_bar=False):
+def install_prefix_name(value):
+    """argparse type for --install-prefix: it names part of one directory, never a path."""
+    if not re.fullmatch(r"[\w.+-]*", value):
+        raise argparse.ArgumentTypeError(
+            f"invalid prefix '{value}': use only letters, digits, '.', '_', '+' and '-' "
+            "(it is the start of a directory name, not a path)")
+    return value
+
+
+def install_conflict(rows):
+    """Return a message if rows hold more than one download for a major version, else None.
+
+    Each major version is installed into one directory, so two platforms of the same release
+    (say linux-x64 and macos-aarch64 JDK 25) would fight over it.
+    """
+    platforms = {}
+    for row in rows:
+        platforms.setdefault(row["major"], []).append(f"{row['os']}-{row['arch']}")
+    crowded = [f"JDK {major} has {', '.join(names)}"
+               for major, names in platforms.items() if len(names) > 1]
+    if not crowded:
+        return None
+    return ("--install needs exactly one download for each major version, because each one is "
+            "installed into a single directory: " + "; ".join(crowded)
+            + ". Narrow the choice with --os and --arch, or use --auto")
+
+
+def has_java(directory):
+    """True if directory has a bin/java (bin/java.exe on Windows) launcher."""
+    return any(os.path.isfile(os.path.join(directory, "bin", name)) for name in ("java", "java.exe"))
+
+
+def find_jdk_home(root):
+    """Return the directory under root that holds the JDK itself (bin/, lib/ and so on).
+
+    Archives wrap the JDK in one versioned directory such as jdk-25.0.5+8, and macOS archives put
+    the JDK a level further down, in Contents/Home. The result is the directory that has the
+    bin/java launcher, so none of that wrapping is carried into the installed JDK.
+    """
+    candidates = [root]
+    entries = os.listdir(root)
+    if len(entries) == 1 and os.path.isdir(os.path.join(root, entries[0])):
+        candidates.append(os.path.join(root, entries[0]))
+    candidates += [os.path.join(c, "Contents", "Home") for c in candidates]
+    for candidate in candidates:
+        if has_java(candidate):
+            return candidate
+    raise ValueError("the archive does not hold a JDK (there is no bin/java in it)")
+
+
+def unpack(archive, directory):
+    """Unpack a .tar.gz or .zip archive into directory, refusing anything that would escape it.
+
+    tar files are extracted with the "data" filter, which rejects absolute paths, '..' paths and
+    links that point outside, and drops special permission bits. zipfile removes absolute paths
+    and '..' parts from names itself.
+    """
+    if archive.endswith(".zip"):
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(directory)
+    elif archive.endswith((".tar.gz", ".tgz")):
+        if not hasattr(tarfile, "data_filter"):
+            raise ValueError("this Python cannot safely unpack tar files; update it to a release "
+                             "with tarfile extraction filters (3.9.17, 3.10.12, 3.11.4, 3.12+)")
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extractall(directory, filter="data")
+    else:
+        raise ValueError(f"do not know how to unpack '{os.path.basename(archive)}'")
+
+
+def replace_directory(source, dest):
+    """Move source to dest. An existing JDK at dest is replaced; anything else is left alone.
+
+    The old directory is set aside first and put back if the move fails, so a failure never
+    leaves the installation half done.
+    """
+    if not os.path.lexists(dest):
+        os.replace(source, dest)
+        return
+    if os.path.islink(dest) or not os.path.isdir(dest):
+        raise ValueError(f"'{dest}' exists and is not a directory, so it was not replaced")
+    if not (has_java(dest) or os.path.isfile(os.path.join(dest, "release"))):
+        raise ValueError(f"'{dest}' exists but does not look like a JDK, so it was not replaced")
+    old = f"{dest}.replaced-{os.getpid()}"
+    os.replace(dest, old)
+    try:
+        os.replace(source, dest)
+    except BaseException:
+        os.replace(old, dest)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def install_jdk(archive, major, prefix_dir, install_prefix):
+    """Unpack a downloaded JDK archive as prefix_dir/<install_prefix><major>; return that path.
+
+    The directory holds the JDK directly (prefix_dir/jdk25/bin, .../lib and so on) with no
+    version-named directory inside it. The archive is unpacked in a scratch directory next to the
+    destination and moved into place only when it checks out, and the scratch directory is always
+    removed.
+    """
+    os.makedirs(prefix_dir, exist_ok=True)
+    dest = os.path.join(prefix_dir, f"{install_prefix}{major}")
+    staging = tempfile.mkdtemp(prefix=".jdk-", dir=prefix_dir)
+    try:
+        unpack(archive, staging)
+        replace_directory(find_jdk_home(staging), dest)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return dest
+
+
+def download_all(rows, directory, show_bar=False, installer=None):
     """Download every row's url into directory, reporting progress on stderr.
 
     With show_bar a progress bar is drawn for each file; otherwise one "downloading <name>" line
-    is printed per file. Returns the exit code: 0 if every file downloaded and verified,
-    otherwise 1. A failed file does not stop the rest.
+    is printed per file. installer, if given, is called with (archive_path, row) after each
+    verified download and returns where the JDK was installed. Returns the exit code: 0 if every
+    file downloaded, verified and installed, otherwise 1. A failed file does not stop the rest.
     """
     try:
         os.makedirs(directory, exist_ok=True)
@@ -509,7 +632,7 @@ def download_all(rows, directory, show_bar=False):
         print(json.dumps({"error": f"cannot use target directory '{directory}': {exc}"}),
               file=sys.stderr)
         return 1
-    failures = 0
+    download_failures = install_failures = installed = 0
     for row in rows:
         try:
             name = filename_from_url(row["url"])
@@ -519,14 +642,24 @@ def download_all(rows, directory, show_bar=False):
                     return ProgressBar(name, total, color=use_color(sys.stderr))
             else:
                 print(f"downloading {name}", file=sys.stderr)
-            download_verified(row["url"], row["sha256_url"], os.path.join(directory, name),
-                              make_progress)
+            archive = os.path.join(directory, name)
+            download_verified(row["url"], row["sha256_url"], archive, make_progress)
         except (*NETWORK_ERRORS, ValueError) as exc:
             print(json.dumps({"error": f"failed to download {row['url']}: {exc}"}), file=sys.stderr)
-            failures += 1
-    print(f"downloaded {len(rows) - failures} of {len(rows)} file(s) to {directory}",
+            download_failures += 1
+            continue
+        if installer:
+            try:
+                print(f"installed {installer(archive, row)}", file=sys.stderr)
+                installed += 1
+            except INSTALL_ERRORS as exc:
+                print(json.dumps({"error": f"failed to install {name}: {exc}"}), file=sys.stderr)
+                install_failures += 1
+    print(f"downloaded {len(rows) - download_failures} of {len(rows)} file(s) to {directory}",
           file=sys.stderr)
-    return 1 if failures else 0
+    if installer:
+        print(f"installed {installed} of {len(rows)} JDK(s)", file=sys.stderr)
+    return 1 if download_failures or install_failures else 0
 
 
 def latest_early_access():
@@ -596,6 +729,22 @@ def latest_for_major(major, lts_majors):
     }
 
 
+def finish_downloads(rows, args, show_bar):
+    """Run --download (and --install, if given) for the listed rows; return the exit code."""
+    if not args.download:
+        return 0
+    installer = None
+    if args.install:
+        conflict = install_conflict(rows)
+        if conflict:
+            print(json.dumps({"error": conflict}), file=sys.stderr)
+            return 1
+
+        def installer(archive, row):
+            return install_jdk(archive, row["major"], args.prefix_dir, args.install_prefix)
+    return download_all(rows, args.target_directory, show_bar, installer)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], add_help=False)
     parser.add_argument("--h", "--help", action="help", help="show this help message and exit")
@@ -661,6 +810,23 @@ def main():
         help="the directory --download saves files in (created if it does not exist)",
     )
     parser.add_argument(
+        "--install", action="store_true",
+        help="unpack each downloaded JDK into --prefix-dir, as a directory named "
+             "--install-prefix followed by the major version (--prefix-dir /java "
+             "--install-prefix jdk puts JDK 27 in /java/jdk27). The directory holds the JDK "
+             "itself (bin/, lib/ and so on) with no versioned directory inside it. Needs "
+             "--download, and one download per major version. An existing JDK there is replaced",
+    )
+    parser.add_argument(
+        "--prefix-dir", metavar="DIR",
+        help="the directory --install installs into (created if it does not exist)",
+    )
+    parser.add_argument(
+        "--install-prefix", type=install_prefix_name, metavar="PREFIX",
+        help="the start of each install directory's name; the major version is added to it "
+             "(jdk -> jdk27). Letters, digits, '.', '_', '+' and '-' only",
+    )
+    parser.add_argument(
         "--plain", action="store_true",
         help="no colors in the table and no download progress bar (both are also off when the "
              "output is not a terminal; colors are off when NO_COLOR is set)",
@@ -682,6 +848,17 @@ def main():
     if args.download and (args.list_arch or args.list_os or args.version_only):
         parser.error("argument --download: not allowed with --list-arch, --list-os or "
                      "--version-only")
+    install_args = {"--prefix-dir": args.prefix_dir, "--install-prefix": args.install_prefix}
+    if args.install:
+        if not args.download:
+            parser.error("argument --install: requires --download")
+        for flag, value in install_args.items():
+            if value is None:
+                parser.error(f"argument --install: requires {flag}")
+    else:
+        for flag, value in install_args.items():
+            if value is not None:
+                parser.error(f"argument {flag}: requires --install")
     fields = None
     if args.fields:
         if args.version_only:
@@ -760,7 +937,7 @@ def main():
             "os": args.os_name,
             "early_access": ea,
         }, output_format, EA_COLUMNS, rows, header, fields, color)
-        return download_all(rows, args.target_directory, show_bar) if args.download else 0
+        return finish_downloads(rows, args, show_bar)
 
     try:
         info = get_json("/info/available_releases")
@@ -815,7 +992,7 @@ def main():
         )
     ]
     emit(result, output_format, RELEASE_COLUMNS, rows, header, fields, color)
-    return download_all(rows, args.target_directory, show_bar) if args.download else 0
+    return finish_downloads(rows, args, show_bar)
 
 
 if __name__ == "__main__":

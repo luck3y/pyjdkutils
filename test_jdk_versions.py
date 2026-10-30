@@ -16,8 +16,10 @@ import json
 import os
 import re
 import sys
+import tarfile
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 import jdk_versions as j
@@ -911,12 +913,19 @@ class FieldsTests(unittest.TestCase):
         self.assertEqual(run_csv("--ea", "--count", "1")[0], j.EA_COLUMNS)
 
 
+def closed_http_error():
+    """An HTTPError that owns no open file, so garbage collecting it doesn't warn."""
+    error = j.urllib.request.HTTPError("u", 503, "unavailable", {}, io.BytesIO())
+    error.close()
+    return error
+
+
 class NetworkFailureTests(unittest.TestCase):
     """A failing network must produce a JSON error on stderr and exit code 1, never a traceback."""
 
     ERRORS = [
         ("URLError", j.urllib.request.URLError("name resolution failed")),
-        ("HTTPError", j.urllib.request.HTTPError("u", 503, "unavailable", {}, None)),
+        ("HTTPError", closed_http_error()),
         ("timeout", TimeoutError("timed out")),
         ("ConnectionResetError", ConnectionResetError(104, "Connection reset by peer")),
         ("ConnectionRefusedError", ConnectionRefusedError(111, "Connection refused")),
@@ -1810,6 +1819,607 @@ class PlainFlagTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(run(*argv)[0], 0)
         self.assertIn("--plain", run("--h")[1])
+
+
+# ---------------------------------------------------------------------------------------------
+# --install
+# ---------------------------------------------------------------------------------------------
+
+def build_tar(files, links=None, mode="w:gz"):
+    """A .tar.gz held in memory. files maps name -> bytes; links maps name -> symlink target."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode=mode) as tf:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755 if "/bin/" in name or name.startswith("bin/") else 0o644
+            tf.addfile(info, io.BytesIO(data))
+        for name, target in (links or {}).items():
+            info = tarfile.TarInfo(name)
+            info.type, info.linkname = tarfile.SYMTYPE, target
+            tf.addfile(info)
+    return buf.getvalue()
+
+
+def build_zip(files):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in files.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def jdk_files(top, layout="plain"):
+    """The files of a small JDK. layout: plain (top/bin), mac (top/Contents/Home/bin), windows."""
+    home = f"{top}/Contents/Home" if layout == "mac" else top
+    exe = "java.exe" if layout == "windows" else "java"
+    files = {f"{home}/bin/{exe}": b"launcher", f"{home}/lib/modules": b"modules",
+             f"{home}/release": b'JAVA_VERSION="1"\n', f"{home}/legal/java.base/LICENSE": b"gpl"}
+    if layout == "mac":
+        files[f"{top}/Contents/Info.plist"] = b"plist"
+    return files
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+class TempDirTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def path(self, *parts):
+        return os.path.join(self.tmp, *parts)
+
+    def write(self, name, data):
+        full = self.path(name)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data)
+        return full
+
+    def make_tree(self, root, files):
+        for name, data in files.items():
+            self.write(os.path.join(root, name), data)
+        return self.path(root)
+
+    def tree(self, root):
+        """Every file and directory under root, as sorted relative paths."""
+        found = []
+        for base, dirs, names in os.walk(root):
+            for n in dirs + names:
+                found.append(os.path.relpath(os.path.join(base, n), root))
+        return sorted(found)
+
+
+class InstallPrefixNameTests(unittest.TestCase):
+    def test_accepts_names_that_are_safe_to_use_in_a_directory_name(self):
+        for value in ("jdk", "java-", "OpenJDK_", "temurin.", "j+d", "jdk-", "", "..", "x" * 50):
+            with self.subTest(value=value):
+                self.assertEqual(j.install_prefix_name(value), value)
+
+    def test_rejects_anything_that_could_be_a_path_or_surprising(self):
+        for value in ("a/b", "/abs", "../a", "a\\b", "a b", "a:b", "jdk\n", "jdk\0", "~", "$HOME",
+                      "a;b", "a*"):
+            with self.subTest(value=value):
+                with self.assertRaises(j.argparse.ArgumentTypeError):
+                    j.install_prefix_name(value)
+
+    def test_dots_alone_cannot_climb_out_because_the_major_is_always_added(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "jdk.tar.gz")
+            with open(archive, "wb") as f:
+                f.write(build_tar(jdk_files("jdk-25")))
+            dest = j.install_jdk(archive, 25, os.path.join(tmp, "p"), "..")
+            self.assertEqual(os.path.dirname(dest), os.path.join(tmp, "p"))
+            self.assertEqual(os.path.basename(dest), "..25")
+
+
+class InstallConflictTests(unittest.TestCase):
+    def row(self, major, os_name="linux", arch="x64"):
+        return {"major": major, "os": os_name, "arch": arch}
+
+    def test_one_download_per_major_is_fine(self):
+        self.assertIsNone(j.install_conflict([self.row(25), self.row(21), self.row(17)]))
+        self.assertIsNone(j.install_conflict([]))
+
+    def test_two_platforms_of_one_major_are_a_conflict(self):
+        message = j.install_conflict([self.row(25), self.row(25, "macos", "aarch64"), self.row(21)])
+        self.assertIn("JDK 25 has linux-x64, macos-aarch64", message)
+        self.assertNotIn("JDK 21", message)
+        self.assertIn("--os", message)
+        self.assertIn("--auto", message)
+
+    def test_every_crowded_major_is_named(self):
+        message = j.install_conflict([self.row(25), self.row(25, "windows"), self.row(21),
+                                      self.row(21, arch="aarch64")])
+        self.assertIn("JDK 25", message)
+        self.assertIn("JDK 21", message)
+
+
+class FindJdkHomeTests(TempDirTestCase):
+    def home(self, files):
+        return j.find_jdk_home(self.make_tree("root", files))
+
+    def test_a_versioned_wrapper_directory_is_looked_through(self):
+        self.assertEqual(self.home(jdk_files("jdk-25.0.5+8")), self.path("root", "jdk-25.0.5+8"))
+
+    def test_the_macos_layout_resolves_to_contents_home(self):
+        self.assertEqual(self.home(jdk_files("jdk-25.0.5+8", "mac")),
+                         self.path("root", "jdk-25.0.5+8", "Contents", "Home"))
+
+    def test_the_macos_early_access_layout_resolves_to_contents_home(self):
+        self.assertEqual(self.home(jdk_files("jdk-28.jdk", "mac")),
+                         self.path("root", "jdk-28.jdk", "Contents", "Home"))
+
+    def test_a_windows_jdk_is_found_by_java_exe(self):
+        self.assertEqual(self.home(jdk_files("jdk-25", "windows")), self.path("root", "jdk-25"))
+
+    def test_an_archive_with_no_wrapper_directory_is_accepted(self):
+        self.assertEqual(self.home({"bin/java": b"x", "lib/modules": b"m"}), self.path("root"))
+
+    def test_the_result_is_the_directory_that_holds_bin_not_something_deeper(self):
+        files = {**jdk_files("jdk-25"), "jdk-25/jre/bin/java": b"inner"}
+        self.assertEqual(self.home(files), self.path("root", "jdk-25"))
+
+    def test_a_directory_with_no_launcher_is_not_a_jdk(self):
+        for files in ({"jdk-25/readme.txt": b"x"}, {"jdk-25/bin/javac": b"x"},
+                      {"jdk-25/java/bin/java": b"x"}, {"a/bin/java": b"x", "b/readme": b"y"}):
+            with self.subTest(files=list(files)):
+                with self.assertRaises(ValueError):
+                    j.find_jdk_home(self.make_tree(f"r{len(files)}{list(files)[0][0]}", files))
+
+    def test_an_empty_archive_is_not_a_jdk(self):
+        os.makedirs(self.path("empty"))
+        with self.assertRaises(ValueError):
+            j.find_jdk_home(self.path("empty"))
+
+    def test_a_launcher_that_is_a_directory_does_not_count(self):
+        with self.assertRaises(ValueError):
+            self.home({"jdk-25/bin/java/placeholder": b"x"})
+
+
+class UnpackTests(TempDirTestCase):
+    def archive(self, name, data):
+        return self.write(name, data)
+
+    def test_unpacks_a_tar_gz(self):
+        a = self.archive("jdk.tar.gz", build_tar(jdk_files("jdk-25")))
+        j.unpack(a, self.path("out"))
+        self.assertTrue(os.path.isfile(self.path("out", "jdk-25", "bin", "java")))
+
+    def test_unpacks_a_tgz_and_a_zip(self):
+        j.unpack(self.archive("a.tgz", build_tar(jdk_files("jdk-25"))), self.path("o1"))
+        self.assertTrue(os.path.isfile(self.path("o1", "jdk-25", "bin", "java")))
+        j.unpack(self.archive("a.zip", build_zip(jdk_files("jdk-25", "windows"))), self.path("o2"))
+        self.assertTrue(os.path.isfile(self.path("o2", "jdk-25", "bin", "java.exe")))
+
+    @unittest.skipUnless(os.name == "posix", "needs POSIX permissions and symlinks")
+    def test_keeps_symlinks_and_the_executable_bit(self):
+        data = build_tar(jdk_files("jdk-25"), links={"jdk-25/legal/jdk.x/LICENSE": "../java.base/LICENSE"})
+        j.unpack(self.archive("jdk.tar.gz", data), self.path("out"))
+        link = self.path("out", "jdk-25", "legal", "jdk.x", "LICENSE")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(read_bytes(link), b"gpl")
+        self.assertTrue(os.access(self.path("out", "jdk-25", "bin", "java"), os.X_OK))
+
+    def test_unknown_archive_types_are_rejected(self):
+        for name in ("jdk.rar", "jdk.tar.bz2", "jdk", "jdk.tar"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    j.unpack(self.archive(name, b"x"), self.path("out"))
+
+    def test_a_tar_cannot_write_outside_the_target(self):
+        data = build_tar({"../escaped.txt": b"x", "jdk-25/bin/java": b"x"})
+        with self.assertRaises(tarfile.TarError):
+            j.unpack(self.archive("evil.tar.gz", data), self.path("out"))
+        self.assertFalse(os.path.exists(self.path("escaped.txt")))
+
+    def test_a_tar_cannot_use_an_absolute_path(self):
+        target = self.path("abs.txt")
+        data = build_tar({target: b"x"})
+        j.unpack(self.archive("abs.tar.gz", data), self.path("out"))
+        self.assertFalse(os.path.exists(target), "an absolute path must not be honored")
+
+    @unittest.skipUnless(os.name == "posix", "needs symlinks")
+    def test_a_symlink_pointing_outside_is_rejected(self):
+        data = build_tar({"jdk-25/bin/java": b"x"}, links={"jdk-25/evil": "../../outside"})
+        with self.assertRaises(tarfile.TarError):
+            j.unpack(self.archive("link.tar.gz", data), self.path("out"))
+
+    def test_a_zip_cannot_write_outside_the_target(self):
+        j.unpack(self.archive("evil.zip", build_zip({"../escaped.txt": b"x", "/abs.txt": b"y"})),
+                 self.path("out"))
+        self.assertFalse(os.path.exists(self.path("escaped.txt")))
+        self.assertFalse(os.path.exists("/abs.txt"))
+
+    def test_a_corrupt_archive_raises_one_of_the_install_errors(self):
+        for name, data in (("c.tar.gz", b"not gzip at all"), ("c.zip", b"not a zip"),
+                           ("t.tar.gz", build_tar(jdk_files("jdk-25"))[:40])):
+            with self.subTest(name=name):
+                with self.assertRaises(j.INSTALL_ERRORS):
+                    j.unpack(self.archive(name, data), self.path("out-" + name))
+
+    def test_refuses_to_unpack_tar_without_extraction_filters(self):
+        a = self.archive("jdk.tar.gz", build_tar(jdk_files("jdk-25")))
+        with mock.patch.dict(j.tarfile.__dict__):
+            del j.tarfile.__dict__["data_filter"]
+            with self.assertRaises(ValueError) as caught:
+                j.unpack(a, self.path("out"))
+        self.assertIn("safely", str(caught.exception))
+        self.assertFalse(os.path.exists(self.path("out")))
+
+
+class ReplaceDirectoryTests(TempDirTestCase):
+    def source(self):
+        return self.make_tree("src", {"bin/java": b"new", "release": b"new"})
+
+    def test_moves_into_a_new_place(self):
+        j.replace_directory(self.source(), self.path("dest"))
+        self.assertEqual(read_bytes(self.path("dest", "bin", "java")), b"new")
+        self.assertFalse(os.path.exists(self.path("src")))
+
+    def test_replaces_an_existing_jdk_completely(self):
+        self.make_tree("dest", {"bin/java": b"old", "stale-file": b"old"})
+        j.replace_directory(self.source(), self.path("dest"))
+        self.assertEqual(self.tree(self.path("dest")), ["bin", "bin/java", "release"])
+        self.assertEqual(os.listdir(self.tmp), ["dest"], "no set-aside copy may be left behind")
+
+    def test_replaces_a_directory_that_only_has_a_release_file(self):
+        self.make_tree("dest", {"release": b"old"})
+        j.replace_directory(self.source(), self.path("dest"))
+        self.assertEqual(read_bytes(self.path("dest", "bin", "java")), b"new")
+
+    def test_refuses_to_replace_a_directory_that_is_not_a_jdk(self):
+        self.make_tree("dest", {"my-documents/thesis.txt": b"precious"})
+        with self.assertRaises(ValueError) as caught:
+            j.replace_directory(self.source(), self.path("dest"))
+        self.assertIn("does not look like a JDK", str(caught.exception))
+        self.assertEqual(read_bytes(self.path("dest", "my-documents", "thesis.txt")),
+                         b"precious")
+
+    def test_refuses_to_replace_a_file(self):
+        self.write("dest", b"i am a file")
+        with self.assertRaises(ValueError):
+            j.replace_directory(self.source(), self.path("dest"))
+        self.assertEqual(read_bytes(self.path("dest")), b"i am a file")
+
+    @unittest.skipUnless(os.name == "posix", "needs symlinks")
+    def test_refuses_to_replace_a_symlink_and_leaves_its_target_alone(self):
+        self.make_tree("real", {"bin/java": b"real jdk"})
+        os.symlink(self.path("real"), self.path("dest"))
+        with self.assertRaises(ValueError):
+            j.replace_directory(self.source(), self.path("dest"))
+        self.assertTrue(os.path.islink(self.path("dest")))
+        self.assertEqual(read_bytes(self.path("real", "bin", "java")), b"real jdk")
+
+    def test_puts_the_old_jdk_back_if_the_move_fails(self):
+        self.make_tree("dest", {"bin/java": b"old"})
+        real_replace = os.replace
+        calls = []
+
+        def flaky(src, dst):
+            calls.append((src, dst))
+            if len(calls) == 2:  # the move of the new JDK into place
+                raise OSError("disk full")
+            return real_replace(src, dst)
+
+        with mock.patch.object(j.os, "replace", flaky), self.assertRaises(OSError):
+            j.replace_directory(self.source(), self.path("dest"))
+        self.assertEqual(read_bytes(self.path("dest", "bin", "java")), b"old")
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["dest", "src"])
+
+
+class InstallJdkTests(TempDirTestCase):
+    def archive(self, files, name="jdk.tar.gz", **kw):
+        return self.write(name, build_tar(files, **kw) if name.endswith("gz") else build_zip(files))
+
+    def install(self, archive, major=25, prefix="jdk", where="java"):
+        return j.install_jdk(archive, major, self.path(where), prefix)
+
+    def test_installs_as_prefix_plus_major_directly_under_the_prefix_dir(self):
+        dest = self.install(self.archive(jdk_files("jdk-25.0.5+8")), 25, "jdk", "java")
+        self.assertEqual(dest, self.path("java", "jdk25"))
+        self.assertEqual(os.listdir(self.path("java")), ["jdk25"])
+
+    def test_the_prefix_is_used_as_given(self):
+        for prefix, expected in (("jdk", "jdk27"), ("java-", "java-27"), ("temurin_", "temurin_27"),
+                                 ("", "27"), ("OpenJDK", "OpenJDK27")):
+            with self.subTest(prefix=prefix):
+                dest = self.install(self.archive(jdk_files("jdk-27")), 27, prefix, "p-" + expected)
+                self.assertEqual(os.path.basename(dest), expected)
+
+    def test_the_installed_directory_holds_the_jdk_not_another_java_directory(self):
+        dest = self.install(self.archive(jdk_files("jdk-25.0.5+8")))
+        top = sorted(os.listdir(dest))
+        self.assertEqual(top, ["bin", "legal", "lib", "release"])
+        self.assertFalse([n for n in top if n.startswith(("jdk", "java", "Contents"))])
+        self.assertTrue(os.path.isfile(os.path.join(dest, "bin", "java")))
+
+    def test_macos_archives_install_the_contents_of_contents_home(self):
+        dest = self.install(self.archive(jdk_files("jdk-25.0.5+8", "mac")))
+        self.assertEqual(sorted(os.listdir(dest)), ["bin", "legal", "lib", "release"])
+        self.assertFalse(os.path.exists(os.path.join(dest, "Contents")))
+
+    def test_the_macos_early_access_wrapper_is_not_carried_over(self):
+        dest = self.install(self.archive({"./" + k: v for k, v in jdk_files("jdk-28.jdk", "mac").items()}), 28)
+        self.assertEqual(sorted(os.listdir(dest)), ["bin", "legal", "lib", "release"])
+
+    def test_windows_zips_install_too(self):
+        dest = self.install(self.archive(jdk_files("jdk-25", "windows"), "jdk.zip"))
+        self.assertTrue(os.path.isfile(os.path.join(dest, "bin", "java.exe")))
+        self.assertEqual(sorted(os.listdir(dest)), ["bin", "legal", "lib", "release"])
+
+    @unittest.skipUnless(os.name == "posix", "needs POSIX permissions and symlinks")
+    def test_symlinks_and_permissions_survive_the_install(self):
+        a = self.archive(jdk_files("jdk-25"), links={"jdk-25/legal/jdk.x/LICENSE": "../java.base/LICENSE"})
+        dest = self.install(a)
+        self.assertTrue(os.access(os.path.join(dest, "bin", "java"), os.X_OK))
+        self.assertTrue(os.path.islink(os.path.join(dest, "legal", "jdk.x", "LICENSE")))
+
+    def test_creates_missing_prefix_dirs(self):
+        dest = self.install(self.archive(jdk_files("jdk-25")), where="deep/er/java")
+        self.assertTrue(os.path.isdir(dest))
+
+    def test_no_scratch_directory_is_left_after_success(self):
+        self.install(self.archive(jdk_files("jdk-25")))
+        self.assertEqual(os.listdir(self.path("java")), ["jdk25"])
+
+    def test_no_scratch_directory_is_left_after_a_failure(self):
+        bad = self.archive({"readme.txt": b"not a jdk"})
+        with self.assertRaises(ValueError):
+            self.install(bad)
+        self.assertEqual(os.listdir(self.path("java")), [])
+
+    def test_a_failed_install_leaves_the_existing_jdk_untouched(self):
+        good = self.install(self.archive(jdk_files("jdk-25")))
+        with self.assertRaises(ValueError):
+            self.install(self.archive({"readme.txt": b"x"}, name="bad.tar.gz"))
+        self.assertTrue(os.path.isfile(os.path.join(good, "bin", "java")))
+        self.assertEqual(os.listdir(self.path("java")), ["jdk25"])
+
+    def test_installing_again_replaces_the_old_version(self):
+        self.install(self.archive({**jdk_files("jdk-25"), "jdk-25/OLD": b"x"}))
+        dest = self.install(self.archive(jdk_files("jdk-25"), name="new.tar.gz"))
+        self.assertFalse(os.path.exists(os.path.join(dest, "OLD")))
+
+    def test_two_majors_sit_side_by_side(self):
+        self.install(self.archive(jdk_files("jdk-25")), 25)
+        self.install(self.archive(jdk_files("jdk-21"), name="b.tar.gz"), 21)
+        self.assertEqual(sorted(os.listdir(self.path("java"))), ["jdk21", "jdk25"])
+
+    def test_it_will_not_overwrite_something_that_is_not_a_jdk(self):
+        os.makedirs(self.path("java", "jdk25"))
+        self.write("java/jdk25/notes.txt", b"mine")
+        with self.assertRaises(ValueError):
+            self.install(self.archive(jdk_files("jdk-25")))
+        self.assertEqual(read_bytes(self.path("java", "jdk25", "notes.txt")), b"mine")
+
+    def test_the_archive_itself_is_not_touched(self):
+        a = self.archive(jdk_files("jdk-25"))
+        before = read_bytes(a)
+        self.install(a)
+        self.assertEqual(read_bytes(a), before)
+
+
+def archive_world(not_jdk=(), corrupt=(), fail=()):
+    """A fetch and urlopen pair that serve real JDK-shaped archives with matching checksums.
+
+    URLs containing a string in not_jdk serve an archive with no JDK in it; those in corrupt
+    serve bytes that don't match the published checksum; those in fail raise OSError.
+    """
+    cache = {}
+
+    def build(url):
+        if url not in cache:
+            match = re.search(r"/jdk-(\d+)/|jdk(\d+)/", url)
+            major = match.group(1) or match.group(2)
+            if any(n in url for n in not_jdk):
+                cache[url] = build_tar({"readme.txt": b"not a jdk"})
+            elif "windows" in url:
+                files = jdk_files(f"jdk-{major}", "windows")
+                cache[url] = build_zip(files) if url.endswith(".zip") else build_tar(files)
+            else:
+                cache[url] = build_tar(jdk_files(f"jdk-{major}.0.1+1"))
+        return cache[url]
+
+    def fetch(url, accept):
+        if url.endswith((".sha256.txt", ".sha256")):
+            return hashlib.sha256(build(url.rsplit(".sha256", 1)[0])).hexdigest() + "  file"
+        return fake_fetch(url, accept)
+
+    def urlopen(req, timeout=None):
+        url = req.full_url
+        if any(f in url for f in fail):
+            raise OSError("connection refused")
+        data = build(url)
+        if any(c in url for c in corrupt):
+            data += b"tampered"
+        resp = FakeResponse(data)
+        resp.headers = {"Content-Length": str(len(data))}
+        return resp
+
+    return fetch, urlopen
+
+
+class InstallFlagTests(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.dl, self.prefix = self.path("dl"), self.path("java")
+
+    def go(self, *argv, world=None, install=True):
+        fetch, urlopen = world or archive_world()
+        args = [*argv, "--plain", "--download", "--target-directory", self.dl]
+        if install:
+            args += ["--install", "--prefix-dir", self.prefix, "--install-prefix", "jdk"]
+        with mock.patch.object(j.urllib.request, "urlopen", urlopen):
+            return run(*args, fetch=fetch)
+
+    LTS2 = ("--lts", "--os", "linux", "--arch", "x64", "--count", "2")
+
+    def test_installs_every_downloaded_jdk_as_prefix_plus_major(self):
+        code, _, err = self.go(*self.LTS2)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(os.listdir(self.prefix)), ["jdk21", "jdk25"])
+        for major in (21, 25):
+            self.assertTrue(os.path.isfile(os.path.join(self.prefix, f"jdk{major}", "bin", "java")))
+
+    def test_the_example_from_the_docs_prefix_dir_java_prefix_jdk_puts_jdk_27_at_java_jdk27(self):
+        self.prefix = self.path("java")
+        code, _, err = self.go("--non-lts", "--os", "linux", "--arch", "x64")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(os.listdir(self.prefix), ["jdk27"])
+        self.assertEqual(sorted(os.listdir(self.path("java", "jdk27"))),
+                         ["bin", "legal", "lib", "release"])
+
+    def test_nothing_nested_inside_the_installed_directories(self):
+        self.go(*self.LTS2)
+        for major in (21, 25):
+            top = os.listdir(os.path.join(self.prefix, f"jdk{major}"))
+            self.assertFalse([n for n in top if n.startswith(("jdk", "java"))], top)
+
+    def test_the_downloaded_archives_are_kept(self):
+        self.go(*self.LTS2)
+        self.assertEqual(len(os.listdir(self.dl)), 2)
+
+    def test_progress_names_each_install_and_counts_them(self):
+        _, _, err = self.go(*self.LTS2)
+        self.assertIn("installed " + os.path.join(self.prefix, "jdk25"), err)
+        self.assertIn("installed " + os.path.join(self.prefix, "jdk21"), err)
+        self.assertIn("installed 2 of 2 JDK(s)", err)
+        self.assertIn("downloaded 2 of 2 file(s)", err)
+
+    def test_the_listing_still_goes_to_stdout_unchanged(self):
+        _, out, _ = self.go(*self.LTS2, "--json")
+        self.assertEqual(len(json.loads(out)["releases"]), 2)
+
+    def test_a_download_that_is_not_a_jdk_fails_but_the_others_install(self):
+        code, _, err = self.go(*self.LTS2, world=archive_world(not_jdk=["jdk-25"]))
+        self.assertEqual(code, 1)
+        self.assertEqual(os.listdir(self.prefix), ["jdk21"])
+        self.assertIn("failed to install", err)
+        self.assertIn("no bin/java", err)
+        self.assertIn("installed 1 of 2 JDK(s)", err)
+        error_lines = [l for l in err.splitlines() if l.startswith("{")]
+        self.assertTrue(all("error" in json.loads(l) for l in error_lines))
+
+    def test_a_corrupt_download_is_never_installed(self):
+        code, _, err = self.go(*self.LTS2, world=archive_world(corrupt=["jdk-21"]))
+        self.assertEqual(code, 1)
+        self.assertEqual(os.listdir(self.prefix), ["jdk25"])
+        self.assertIn("checksum mismatch", err)
+        self.assertIn("downloaded 1 of 2", err)
+        self.assertIn("installed 1 of 2", err)
+
+    def test_a_failed_connection_is_never_installed(self):
+        code, _, err = self.go(*self.LTS2, world=archive_world(fail=["jdk-25"]))
+        self.assertEqual(code, 1)
+        self.assertEqual(os.listdir(self.prefix), ["jdk21"])
+
+    def test_two_platforms_of_one_major_are_refused_before_anything_is_downloaded(self):
+        fetch, _ = archive_world()
+        with mock.patch.object(j.urllib.request, "urlopen",
+                               side_effect=AssertionError("no download expected")):
+            code, out, err = run("--lts", "--plain", "--download", "--target-directory", self.dl,
+                                 "--install", "--prefix-dir", self.prefix, "--install-prefix", "jdk",
+                                 fetch=fetch)
+        self.assertEqual(code, 1)
+        self.assertIn("exactly one download for each major version", json.loads(err)["error"])
+        self.assertFalse(os.path.exists(self.dl))
+        self.assertFalse(os.path.exists(self.prefix))
+
+    def test_an_existing_non_jdk_directory_is_not_overwritten(self):
+        os.makedirs(os.path.join(self.prefix, "jdk25"))
+        self.write("java/jdk25/mine.txt", b"keep me")
+        code, _, err = self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("does not look like a JDK", err)
+        self.assertEqual(read_bytes(self.path("java", "jdk25", "mine.txt")), b"keep me")
+
+    def test_installing_over_an_older_install_replaces_it(self):
+        self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+        self.write("java/jdk25/OLD", b"x")
+        code, _, err = self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.path("java", "jdk25", "OLD")))
+
+    def test_works_for_early_access_builds(self):
+        code, _, err = self.go("--ea", "--os", "linux", "--arch", "x64")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(os.listdir(self.prefix), ["jdk28"])
+        self.assertTrue(os.path.isfile(os.path.join(self.prefix, "jdk28", "bin", "java")))
+
+    def test_windows_builds_install_with_java_exe(self):
+        code, _, err = self.go("--lts", "--os", "windows", "--arch", "x64", "--count", "1")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isfile(os.path.join(self.prefix, "jdk25", "bin", "java.exe")))
+
+    def test_without_install_nothing_is_unpacked(self):
+        code, _, err = self.go(*self.LTS2, install=False)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(os.listdir(self.dl)), 2)
+        self.assertFalse(os.path.exists(self.prefix))
+
+    def test_an_unusable_prefix_dir_is_reported_as_an_install_failure(self):
+        self.write("java", b"a file where the directory should go")
+        code, _, err = self.go("--lts", "--os", "linux", "--arch", "x64", "--count", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("failed to install", err)
+
+    def test_the_prefix_can_be_empty(self):
+        fetch, urlopen = archive_world()
+        with mock.patch.object(j.urllib.request, "urlopen", urlopen):
+            code, _, err = run("--lts", "--os", "linux", "--arch", "x64", "--count", "1", "--plain",
+                               "--download", "--target-directory", self.dl, "--install",
+                               "--prefix-dir", self.prefix, "--install-prefix", "", fetch=fetch)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(os.listdir(self.prefix), ["25"])
+
+
+class InstallArgumentTests(unittest.TestCase):
+    FULL = ("--download", "--target-directory", "dl", "--install", "--prefix-dir", "p",
+            "--install-prefix", "jdk")
+
+    def assert_rejected(self, *argv):
+        code, out, err = run(*argv, fetch=raising(AssertionError("no network!")))
+        self.assertEqual(code, 2, f"{argv} should be rejected (stderr: {err})")
+        self.assertEqual(out, "")
+
+    def test_install_needs_download_prefix_dir_and_install_prefix(self):
+        self.assert_rejected("--lts", "--install", "--prefix-dir", "p", "--install-prefix", "jdk")
+        self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",
+                             "--install-prefix", "jdk")
+        self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",
+                             "--prefix-dir", "p")
+        self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install")
+
+    def test_the_prefix_flags_need_install(self):
+        self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--prefix-dir", "p")
+        self.assert_rejected("--lts", "--download", "--target-directory", "dl",
+                             "--install-prefix", "jdk")
+
+    def test_a_prefix_that_is_a_path_is_rejected(self):
+        for bad in ("a/b", "../x", "/abs", "a b"):
+            with self.subTest(bad=bad):
+                self.assert_rejected("--lts", "--download", "--target-directory", "dl", "--install",
+                                     "--prefix-dir", "p", "--install-prefix", bad)
+
+    def test_not_allowed_with_the_modes_that_cannot_download(self):
+        for mode in ("--list-arch", "--list-os", "--version-only"):
+            with self.subTest(mode=mode):
+                self.assert_rejected(mode, *self.FULL)
+
+    def test_the_flags_need_values(self):
+        self.assert_rejected("--lts", *self.FULL[:-1])
+        self.assert_rejected("--lts", *self.FULL[:-3])
+
+    def test_the_flags_are_in_the_help(self):
+        _, out, _ = run("--h")
+        for flag in ("--install", "--prefix-dir", "--install-prefix"):
+            self.assertIn(flag, out)
 
 
 class NetworkErrorsConstantTests(unittest.TestCase):
