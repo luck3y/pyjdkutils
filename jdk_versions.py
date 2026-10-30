@@ -30,6 +30,7 @@ Usage:
     python3 jdk_versions.py --json                                             # JSON output
     python3 jdk_versions.py --list-arch                                        # list all available architectures
     python3 jdk_versions.py --list-os                                          # list all available operating systems
+    python3 jdk_versions.py --list-sources                                     # list all available --source names and aliases
     python3 jdk_versions.py --lts                                              # only LTS releases
     python3 jdk_versions.py --lts --os macos --arch aarch64                    # LTS releases, macOS/aarch64 only
     python3 jdk_versions.py --lts --version-only                               # LTS major versions, one per line
@@ -913,6 +914,11 @@ def main():
         "--list-os", action="store_true",
         help="list all operating systems available from the Adoptium API and exit",
     )
+    group.add_argument(
+        "--list-sources", action="store_true",
+        help="list all available source names (for use with --source) and exit. "
+             "Requires no network access",
+    )
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="output JSON instead of a table")
     fmt.add_argument("--csv", action="store_true", help="output CSV instead of a table")
@@ -1018,6 +1024,15 @@ def main():
              "Not available with --ea (which always uses jdk.java.net)",
     )
     args = parser.parse_args()
+
+    if args.list_sources:
+        rows = [{"source": k, "aliases": ", ".join(a for a, t in SOURCE_ALIASES.items() if t == k)}
+                for k in SOURCES]
+        output_format = "csv" if args.csv else "json" if args.json else "table"
+        emit({"sources": list(SOURCES.keys())}, output_format,
+             ["source", "aliases"], rows, not args.no_header, None, False)
+        return 0
+
     if args.version_only and (args.list_arch or args.list_os):
         parser.error("argument --version-only: not allowed with --list-arch or --list-os")
     if args.auto and (args.list_arch or args.list_os):

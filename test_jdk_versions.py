@@ -638,6 +638,42 @@ class ListTests(unittest.TestCase):
         data = json.loads(run("--list-arch", "--json", "--os", "linux", "--arch", "x64")[1])
         self.assertEqual((data["os"], data["arch"]), ("linux", "x64"))
 
+    def test_list_sources_table(self):
+        _, out, _ = run("--list-sources")
+        for name in j.SOURCES:
+            self.assertIn(name, out)
+
+    def test_list_sources_json(self):
+        data = json.loads(run("--list-sources", "--json")[1])
+        self.assertEqual(set(data["sources"]), set(j.SOURCES.keys()))
+
+    def test_list_sources_csv(self):
+        rows = run_csv("--list-sources")
+        self.assertEqual(rows[0], ["source", "aliases"])
+        sources_in_csv = {r[0] for r in rows[1:]}
+        self.assertEqual(sources_in_csv, set(j.SOURCES.keys()))
+
+    def test_list_sources_aliases_are_present(self):
+        _, out, _ = run("--list-sources")
+        for alias in j.SOURCE_ALIASES:
+            self.assertIn(alias, out)
+
+    def test_list_sources_no_header(self):
+        _, with_hdr, _ = run("--list-sources")
+        _, without, _ = run("--list-sources", "--no-header")
+        self.assertIn("source", with_hdr)
+        self.assertNotIn("source", without.splitlines()[0] if without else "")
+
+    def test_list_sources_needs_no_network(self):
+        # Should succeed even when every network call raises
+        code, out, _ = run("--list-sources", fetch=raising(AssertionError("no network!")))
+        self.assertEqual(code, 0)
+        self.assertIn("temurin", out)
+
+    def test_list_sources_mutually_exclusive_with_ea(self):
+        code, out, err = run("--list-sources", "--ea")
+        self.assertEqual((code, out), (2, ""))
+
 
 class AutoTests(unittest.TestCase):
     @staticmethod
