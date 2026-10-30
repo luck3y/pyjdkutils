@@ -79,15 +79,10 @@ Get the newest LTS download link for a script. `--no-header` leaves out the CSV 
 python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --csv --no-header | cut -d, -f8
 ```
 
-Download the newest LTS tarball and check it against its published checksum:
+Download the newest LTS tarball, verify its SHA-256 checksum, and save it to `jdks/`:
 
 ```
-ROW=$(python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --csv --no-header)
-URL=$(echo "$ROW" | cut -d, -f8)
-SHA_URL=$(echo "$ROW" | cut -d, -f9)
-
-curl -L -o jdk.tar.gz "$URL"
-echo "$(curl -sL "$SHA_URL" | cut -d' ' -f1)  jdk.tar.gz" | sha256sum -c -
+python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --download --target-directory jdks
 ```
 
 On ARM64 Linux (for example a Raspberry Pi 4/5 or AWS Graviton), use `--arch aarch64`. On Alpine
@@ -124,15 +119,10 @@ Which major versions have an Apple Silicon build:
 python3 jdk_versions.py --all --os macos --arch aarch64 --version-only
 ```
 
-Download the newest LTS for this Mac and verify it:
+Download the newest LTS for this Mac, verify its SHA-256 checksum, and save it to `jdks/`:
 
 ```
-ROW=$(python3 jdk_versions.py --auto --lts --count 1 --csv --no-header)
-URL=$(echo "$ROW" | cut -d, -f8)
-SHA_URL=$(echo "$ROW" | cut -d, -f9)
-
-curl -L -o jdk.tar.gz "$URL"
-echo "$(curl -sL "$SHA_URL" | cut -d' ' -f1)  jdk.tar.gz" | shasum -a 256 -c -
+python3 jdk_versions.py --auto --lts --count 1 --download --target-directory jdks
 ```
 
 ### Windows x64
@@ -145,25 +135,14 @@ python jdk_versions.py --lts --os windows --arch x64
 `--arch aarch64`. Windows on ARM builds exist for only a few releases (at the time of writing, 21
 and 23). Check with `--all --os windows --arch aarch64 --version-only`.
 
-Download the newest LTS zip and verify it in PowerShell:
+Download the newest LTS zip and verify its SHA-256 checksum:
 
-```powershell
-$row = python jdk_versions.py --lts --os windows --arch x64 --count 1 --json |
-       ConvertFrom-Json
-$dl  = $row.releases[0].downloads.'windows-x64'
-
-Invoke-WebRequest -Uri $dl.url -OutFile jdk.zip
-Invoke-WebRequest -Uri $dl.sha256_url -OutFile jdk.zip.sha256
-$expected = (Get-Content jdk.zip.sha256 -TotalCount 1).Split(' ')[0].Trim()
-$actual   = (Get-FileHash jdk.zip -Algorithm SHA256).Hash
-if ($actual -ieq $expected) { 'checksum OK' } else { throw 'checksum mismatch' }
+```
+python jdk_versions.py --lts --os windows --arch x64 --count 1 --download --target-directory jdks
 ```
 
-The checksum file is saved to disk and read back as text, because the server sends it as a binary
-content type and `Invoke-WebRequest` would otherwise return raw bytes.
-
-`cmd.exe` has no good way to parse the output. Use PowerShell, or run the script with `--csv` and
-read the result with whatever tool you have.
+`cmd.exe` has no good way to parse the output. Use the script directly with `--download`, or run it
+with `--csv` and read the result with whatever tool you have.
 
 ### Early-access builds
 
@@ -201,9 +180,10 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--fields FIELD ...` | Outputs only these fields, in this order. See [Choosing fields](#choosing-fields). |
 | `--download` | Downloads every listed result into `--target-directory`. See [Downloading files](#downloading-files). |
 | `--target-directory DIR` | The directory `--download` saves files in. It is created if it does not exist. |
-| `--install` | Unpacks each downloaded JDK into `--prefix-dir`. See [Installing JDKs](#installing-jdks). |
+| `--install` | Downloads (implies `--download`) and unpacks each JDK into `--prefix-dir`. See [Installing JDKs](#installing-jdks). |
 | `--prefix-dir DIR` | The directory `--install` installs into. It is created if it does not exist. |
 | `--install-prefix PREFIX` | The start of each install directory's name. The major version is added to it, so `jdk` gives `jdk27`. |
+| `--force` | Re-downloads a file even if the local copy already matches the remote SHA-256 checksum. By default already-up-to-date files are skipped. |
 | `--plain` | Turns off the colors and the download progress bar. See [Colors and the progress bar](#colors-and-the-progress-bar). |
 | `--h`, `--help` | Shows the help text. Note that `-h` is not accepted. |
 
@@ -215,8 +195,9 @@ Rules for combining options:
 - `--fields` cannot be used with `--version-only`.
 - `--download` and `--target-directory` must be used together. `--download` cannot be used with
   `--version-only`, `--list-arch` or `--list-os`.
-- `--install` requires `--download`, `--prefix-dir` and `--install-prefix`. `--prefix-dir` and
-  `--install-prefix` cannot be used without `--install`.
+- `--install` implies `--download`. It requires `--target-directory`, `--prefix-dir` and
+  `--install-prefix`. `--prefix-dir` and `--install-prefix` cannot be used without `--install`.
+- `--force` only has an effect when `--download` or `--install` is also given.
 - `--count` must be a whole number of 1 or more.
 - Everything else can be combined. `--arch`, `--os`, `--auto`, `--count`, `--no-header`, `--download`, `--install`,
   `--plain` and the output formats work with `--ea` too.
@@ -342,7 +323,10 @@ python3 jdk_versions.py --ea --os windows --arch x64 --download --target-directo
 - Each file is checked against its published SHA-256 checksum. The data is written to a `.part`
   file first and renamed only when the checksum matches, so a failed download never leaves a file
   under the real name.
-- Files keep the name from their download link. An existing file with that name is replaced.
+- **Already-up-to-date files are skipped.** Before downloading, the remote checksum is fetched and
+  compared with the local file. If they match, the file is skipped and `skipping <name> (already up
+  to date)` is printed to stderr. Use `--force` to download regardless.
+- Files keep the name from their download link. A file that is not up to date is replaced.
 - A failed file does not stop the others. The script then exits with code 1 and prints one JSON
   error per failed file on stderr.
 - Downloads use HTTPS only, with a 20 second timeout on each connection and no retries. The files
@@ -353,16 +337,17 @@ python3 jdk_versions.py --ea --os windows --arch x64 --download --target-directo
 
 ## Installing JDKs
 
-`--install` unpacks every JDK that `--download` has fetched and verified. Each one goes into its
-own directory under `--prefix-dir`, named `--install-prefix` followed by the major version.
+`--install` downloads (implies `--download`) and unpacks each JDK. Each one goes into its own
+directory under `--prefix-dir`, named `--install-prefix` followed by the major version.
 
 ```
-python3 jdk_versions.py --auto --non-lts --count 1 --download --target-directory ~/dl \
-    --install --prefix-dir /java --install-prefix jdk
+python3 jdk_versions.py --auto --non-lts --count 1 \
+    --install --target-directory ~/dl --prefix-dir /java --install-prefix jdk
 ```
 
 If the newest feature release is JDK 27, that installs it as `/java/jdk27`. With `--lts --count 2`
-you would get `/java/jdk25` and `/java/jdk21`.
+you would get `/java/jdk25` and `/java/jdk21`. Running the same command again skips the download if
+the archive is already up to date, then re-installs from the cached archive.
 
 - **The JDK sits directly in that directory.** `/java/jdk27/bin/java`, `/java/jdk27/lib` and so on.
   There is no `jdk-27.0.1+1` directory inside it, and on macOS the `Contents/Home` wrapper is
@@ -502,7 +487,7 @@ error. Pass `--os` and `--arch` yourself in that case.
 |---|---|
 | `0` | Success. |
 | `1` | A runtime failure. Network problems, no release matches the filters, `--auto` could not detect the platform, the jdk.java.net page layout changed, a `--download` failed (an unusable target directory, a network error or a checksum mismatch), or an `--install` failed (an archive that is not a JDK, an unusable `--prefix-dir`, or two downloads for one major version). |
-| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name `--download` without `--target-directory`, or `--install` without `--download`, `--prefix-dir` or `--install-prefix`. |
+| `2` | Bad usage, such as an unknown flag, a conflicting combination, an invalid `--count`, an unknown `--fields` name, `--download` without `--target-directory`, or `--install` without `--target-directory`, `--prefix-dir` or `--install-prefix`. |
 
 Runtime failures print a JSON object on **stderr**, and nothing on stdout:
 
@@ -554,15 +539,16 @@ up to date.
 A second workflow, [`.github/workflows/install-jdk.yml`](.github/workflows/install-jdk.yml), uses
 the script to install the latest non-LTS JDK on the runner. `--auto` picks the runner's OS and
 architecture, so it works unchanged on Linux x64, Linux ARM64, macOS (Apple Silicon) and Windows
-x64. A single command does the lookup and the download, and `--download` checks the archive against
-its SHA-256 checksum:
+x64. `--install` implies `--download`, so a single command fetches, verifies and unpacks the JDK:
 
 ```
-python jdk_versions.py --auto --non-lts --count 1 --download --target-directory "$DOWNLOAD_DIR"
+python jdk_versions.py --auto --non-lts --count 1 \
+    --install --target-directory "$DOWNLOAD_DIR" \
+    --prefix-dir "$PREFIX_DIR" --install-prefix jdk
 ```
 
-The workflow then unpacks the archive, sets `JAVA_HOME` and `PATH`, and runs `java -version`. It is
-also a worked example of using the script in a pipeline.
+The workflow then sets `JAVA_HOME` and `PATH` from the known install path and runs `java -version`.
+It is also a worked example of using the script in a pipeline.
 
 ## Author
 
