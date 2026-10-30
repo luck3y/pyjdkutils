@@ -34,6 +34,9 @@ Python standard library.
   architectures.
 - **GA releases (`--source semeru`):** [AdoptOpenJDK API](https://api.adoptopenjdk.net) — IBM
   Semeru (OpenJ9-based) builds. Use `--source ibm` as an alias.
+- **All GA distributions (`--source all`):** Fetches and merges results from every configured
+  source. Each row in the output carries a `source` column identifying its origin. Not available
+  with `--ea`, `--list-arch`, or `--list-os`.
 - **Early-access builds (`--ea`):** [jdk.java.net](https://jdk.java.net) — the Oracle-led OpenJDK
   early-access builds for the next major version, before it reaches GA.
 
@@ -194,7 +197,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 | Option | What it does |
 |---|---|
 | *(none)* | Prints the LTS releases plus the latest feature release, as a table. |
-| `--source SOURCE` | The JDK distribution to query for GA releases: `temurin` (default, Eclipse Temurin via Adoptium API) or `semeru` (IBM Semeru via AdoptOpenJDK API). Aliases: `ibm`, `eclipse`, `openj9`. Not available with `--ea`. |
+| `--source SOURCE` | The JDK distribution to query for GA releases: `temurin` (default), `semeru`, or `all` (merge every source). Aliases: `ibm`, `eclipse`, `openj9`. Not available with `--ea`. With `all`, each output row gains a `source` column; JSON uses a `sources` list instead of a single `source` string. |
 | `--all` | Includes every major release the chosen source publishes, not only the LTS releases and the latest feature release. |
 | `--lts` | Returns only LTS releases. |
 | `--non-lts` | Returns only non-LTS releases. Without `--all` that is just the latest feature release. |
@@ -224,7 +227,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 Rules for combining options:
 
 - `--lts`, `--non-lts`, `--ea`, `--list-arch` and `--list-os` are mutually exclusive.
-- `--source` selects the GA distribution and can be combined with all GA modes. It is not available with `--ea`, which always uses jdk.java.net.
+- `--source` selects the GA distribution and can be combined with all GA modes. It is not available with `--ea` (which always uses jdk.java.net), and `--source all` is additionally not available with `--list-arch` or `--list-os`.
 - `--major` can be combined with any mode. With `--lts` or `--non-lts` it further narrows the result; an error is returned if the requested version is not available or does not match the LTS/non-LTS filter.
 - `--json` and `--csv` are mutually exclusive.
 - `--auto` and `--version-only` cannot be used with `--list-arch` or `--list-os`.

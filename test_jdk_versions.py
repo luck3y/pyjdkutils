@@ -84,18 +84,19 @@ def fake_fetch(url, accept):
     if url.endswith((".sha256.txt", ".sha256")):
         data = payload_for(url.rsplit(".sha256", 1)[0])
         return hashlib.sha256(data).hexdigest() + "  " + url.rsplit("/", 1)[-1]
-    _api_base = j.SOURCES["temurin"][0]
-    if url.startswith(_api_base):
-        path = url[len(_api_base):]
-        if path == "/info/available_releases":
-            return json.dumps(AVAILABLE)
-        if path == "/types/architectures":
-            return json.dumps(["x64", "x32", "aarch64", "arm"])
-        if path == "/types/operating_systems":
-            return json.dumps(["linux", "windows", "mac", "alpine-linux"])
-        if path.startswith("/assets/latest/"):
-            major = int(path.split("/")[3])
-            return json.dumps([asset(major, o, a) for o, a in PLATFORMS[major]])
+    # Both the Temurin and Semeru API bases serve the same canned data for tests.
+    for _source_key, (_api_base, _jvm_impl, _label) in j.SOURCES.items():
+        if url.startswith(_api_base):
+            path = url[len(_api_base):]
+            if path == "/info/available_releases":
+                return json.dumps(AVAILABLE)
+            if path == "/types/architectures":
+                return json.dumps(["x64", "x32", "aarch64", "arm"])
+            if path == "/types/operating_systems":
+                return json.dumps(["linux", "windows", "mac", "alpine-linux"])
+            if path.startswith("/assets/latest/"):
+                major = int(path.split("/")[3])
+                return json.dumps([asset(major, o, a) for o, a in PLATFORMS[major]])
     if url == f"{j.EA_SITE}/":
         return EA_HOME
     if url == f"{j.EA_SITE}/28/":
@@ -463,7 +464,7 @@ class CountTests(unittest.TestCase):
 
     def test_count_applies_after_filters(self):
         rows = run_csv("--lts", "--os", "linux", "--arch", "x64", "--count", "1")[1:]
-        self.assertEqual([(r[0], r[5], r[6]) for r in rows], [("25", "linux", "x64")])
+        self.assertEqual([(r[0], r[6], r[7]) for r in rows], [("25", "linux", "x64")])
 
     def test_count_with_version_only_limits_versions(self):
         code, out, _ = run("--lts", "--version-only", "--count", "2")
@@ -531,12 +532,13 @@ class OutputFormatTests(unittest.TestCase):
     def test_csv_columns_and_row_count(self):
         rows = run_csv("--lts")
         self.assertEqual(rows[0], ["major", "version", "release_name", "lts", "released",
-                                   "os", "arch", "url", "sha256_url"])
+                                   "source", "os", "arch", "url", "sha256_url"])
         self.assertEqual(len(rows) - 1, 6 + 6 + 3 + 2)
-        self.assertTrue(all(len(r) == 9 for r in rows))
-        self.assertEqual(rows[1][:7], ["25", "25.0.1+1", "jdk-25.0.1+1", "true",
-                                       "2026-01-25T00:00:00Z", "alpine-linux", "x64"])
-        self.assertTrue(rows[1][8].endswith(".sha256.txt"))
+        self.assertTrue(all(len(r) == 10 for r in rows))
+        self.assertEqual(rows[1][:8], ["25", "25.0.1+1", "jdk-25.0.1+1", "true",
+                                       "2026-01-25T00:00:00Z",
+                                       j.SOURCES["temurin"][2], "alpine-linux", "x64"])
+        self.assertTrue(rows[1][9].endswith(".sha256.txt"))
 
     def test_no_header_csv(self):
         with_header = run_csv("--lts")
@@ -590,10 +592,11 @@ class EarlyAccessTests(unittest.TestCase):
 
     def test_csv(self):
         rows = run_csv("--ea", "--os", "linux")
-        self.assertEqual(rows[0], ["major", "version", "build", "released", "os", "arch",
+        self.assertEqual(rows[0], ["major", "version", "build", "released", "source", "os", "arch",
                                    "url", "sha256_url"])
-        self.assertEqual([(r[4], r[5]) for r in rows[1:]], [("linux", "aarch64"), ("linux", "x64")])
+        self.assertEqual([(r[5], r[6]) for r in rows[1:]], [("linux", "aarch64"), ("linux", "x64")])
         self.assertEqual(rows[1][:4], ["28", "28-ea+21", "21", "2026-10-22"])
+        self.assertEqual(rows[1][4], "jdk.java.net (Oracle-led OpenJDK)")
 
     def test_no_match_is_an_error(self):
         code, out, err = run("--ea", "--os", "aix")
@@ -656,10 +659,10 @@ class AutoTests(unittest.TestCase):
     def test_works_with_ea_version_only_count_and_csv(self):
         det = self.detected("linux", "x64")
         rows = run_csv("--auto", "--ea", detected=det)
-        self.assertEqual([(r[4], r[5]) for r in rows[1:]], [("linux", "x64")])
+        self.assertEqual([(r[5], r[6]) for r in rows[1:]], [("linux", "x64")])
         self.assertEqual(run("--auto", "--non-lts", "--version-only", detected=det)[1], "27\n")
         rows = run_csv("--auto", "--lts", "--count", "1", detected=det)
-        self.assertEqual([(r[0], r[5], r[6]) for r in rows[1:]], [("25", "linux", "x64")])
+        self.assertEqual([(r[0], r[6], r[7]) for r in rows[1:]], [("25", "linux", "x64")])
 
     def test_no_match_for_detected_platform_is_an_error(self):
         code, out, err = run("--auto", detected=self.detected("aix", "ppc64"))
@@ -791,9 +794,10 @@ class FieldsTests(unittest.TestCase):
     def test_every_release_field_can_be_selected(self):
         rows = run_csv("--lts", "--count", "1", "--fields", *j.RELEASE_COLUMNS)
         self.assertEqual(rows[0], j.RELEASE_COLUMNS)
-        self.assertEqual(rows[1][:7], ["25", "25.0.1+1", "jdk-25.0.1+1", "true",
-                                       "2026-01-25T00:00:00Z", "alpine-linux", "x64"])
-        self.assertTrue(rows[1][8].endswith(".sha256.txt"))
+        self.assertEqual(rows[1][:8], ["25", "25.0.1+1", "jdk-25.0.1+1", "true",
+                                       "2026-01-25T00:00:00Z",
+                                       j.SOURCES["temurin"][2], "alpine-linux", "x64"])
+        self.assertTrue(rows[1][9].endswith(".sha256.txt"))
 
     def test_table_output(self):
         _, out, _ = run(*self.BASE, "--count", "2", "--fields", "version,os")
@@ -886,7 +890,7 @@ class FieldsTests(unittest.TestCase):
         code, _, err = run("--fields", "version,bogus")
         self.assertEqual(code, 2)
         self.assertIn("unknown field 'bogus'", err)
-        self.assertIn("valid fields: major, version, release_name, lts", err)
+        self.assertIn("valid fields: major, version, release_name, lts, released, source", err)
 
     def test_empty_selection_is_rejected(self):
         for argv in [("--fields", ","), ("--fields", " ")]:
@@ -2431,6 +2435,89 @@ class InstallArgumentTests(unittest.TestCase):
         _, out, _ = run("--h")
         for flag in ("--install", "--prefix-dir", "--install-prefix"):
             self.assertIn(flag, out)
+
+
+class SourceAllTests(unittest.TestCase):
+    """Tests for --source all (merge GA releases from every source in SOURCES)."""
+
+    def test_json_has_sources_list_not_source_string(self):
+        data = run_json("--source", "all", "--lts")
+        self.assertIn("sources", data)
+        self.assertNotIn("source", data)
+        self.assertIsInstance(data["sources"], list)
+        self.assertEqual(len(data["sources"]), len(j.SOURCES))
+
+    def test_each_source_label_appears_in_sources_list(self):
+        data = run_json("--source", "all", "--lts")
+        labels = {sl for _, _, sl in j.SOURCES.values()}
+        self.assertEqual(set(data["sources"]), labels)
+
+    def test_releases_have_source_field(self):
+        data = run_json("--source", "all", "--lts")
+        for r in data["releases"]:
+            self.assertIn("source", r)
+            self.assertIn(r["source"], {sl for _, _, sl in j.SOURCES.values()})
+
+    def test_releases_sorted_by_major_descending(self):
+        data = run_json("--source", "all", "--lts")
+        majors = [r["major"] for r in data["releases"]]
+        self.assertEqual(majors, sorted(majors, reverse=True))
+
+    def test_same_major_appears_once_per_source(self):
+        data = run_json("--source", "all", "--lts")
+        pairs = [(r["major"], r["source"]) for r in data["releases"]]
+        self.assertEqual(len(pairs), len(set(pairs)))
+
+    def test_csv_source_column_is_populated(self):
+        rows = run_csv("--source", "all", "--lts", "--count", "1")
+        self.assertEqual(rows[0][5], "source")
+        self.assertNotEqual(rows[1][5], "")  # non-empty source label
+
+    def test_table_includes_source_label(self):
+        _, out, _ = run("--source", "all", "--lts", "--count", "1")
+        labels = [sl for _, _, sl in j.SOURCES.values()]
+        self.assertTrue(any(lbl in out for lbl in labels))
+
+    def test_version_only_deduplicates_across_sources(self):
+        code, out, _ = run("--source", "all", "--lts", "--version-only")
+        versions = [int(v) for v in out.strip().splitlines() if v]
+        # No duplicate major versions
+        self.assertEqual(len(versions), len(set(versions)))
+
+    def test_version_only_json_has_all_sources_label(self):
+        data = run_json("--source", "all", "--lts", "--version-only")
+        self.assertEqual(data["source"], "all sources")
+
+    def test_fields_with_source_all(self):
+        rows = run_csv("--source", "all", "--lts", "--count", "1",
+                       "--fields", "major", "source", "os")
+        self.assertEqual(rows[0], ["major", "source", "os"])
+        self.assertNotEqual(rows[1][1], "")  # source field is populated
+
+    def test_source_all_not_allowed_with_ea(self):
+        code, out, err = run("--source", "all", "--ea")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--ea", err)
+
+    def test_source_all_not_allowed_with_list_arch(self):
+        code, out, err = run("--source", "all", "--list-arch")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--list-arch", err)
+
+    def test_source_all_not_allowed_with_list_os(self):
+        code, out, err = run("--source", "all", "--list-os")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--list-os", err)
+
+    def test_unknown_source_is_still_rejected(self):
+        code, out, err = run("--source", "bogus")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("unknown source", err)
+
+    def test_count_limits_total_rows_across_sources(self):
+        data = run_json("--source", "all", "--lts", "--count", "2")
+        total_rows = sum(len(r["downloads"]) for r in data["releases"])
+        self.assertLessEqual(total_rows, 2)
 
 
 class NetworkErrorsConstantTests(unittest.TestCase):

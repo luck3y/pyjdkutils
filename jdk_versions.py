@@ -11,6 +11,7 @@ Usage:
     python3 jdk_versions.py --major 21 --auto                                  # only JDK 21 for this machine
     python3 jdk_versions.py --source semeru --auto --lts                       # LTS Semeru (IBM) builds for this machine
     python3 jdk_versions.py --source semeru --auto --lts --install --prefix-dir /java --install-prefix jdk   # download + install
+    python3 jdk_versions.py --source all --auto --lts                          # LTS builds from every source for this machine
     python3 jdk_versions.py --all                                              # every available major release
     python3 jdk_versions.py --all --non-lts                                    # every non-LTS major release
     python3 jdk_versions.py --arch x64                                         # only x64 downloads (works with all modes)
@@ -191,9 +192,9 @@ def describe_filters(arch, os_name, major=None):
 
 
 # The fields (columns) available for each kind of output, in their default order.
-RELEASE_COLUMNS = ["major", "version", "release_name", "lts", "released", "os", "arch", "url",
-                   "sha256_url"]
-EA_COLUMNS = ["major", "version", "build", "released", "os", "arch", "url", "sha256_url"]
+RELEASE_COLUMNS = ["major", "version", "release_name", "lts", "released", "source", "os", "arch",
+                   "url", "sha256_url"]
+EA_COLUMNS = ["major", "version", "build", "released", "source", "os", "arch", "url", "sha256_url"]
 
 
 def parse_fields(raw, valid):
@@ -334,7 +335,11 @@ def emit(payload, fmt, columns, rows, header=True, fields=None, color=False):
     if fields:
         columns = fields
         rows = [{f: row.get(f) for f in fields} for row in rows]
-        payload = {**{k: payload[k] for k in ("source", "arch", "os")}, "rows": rows}
+        # "source" is a single string in normal mode; "sources" is a list in --source all mode.
+        source_entry = ({"sources": payload["sources"]} if "sources" in payload
+                        else {"source": payload.get("source")})
+        payload = {**source_entry, "arch": payload.get("arch"), "os": payload.get("os"),
+                   "rows": rows}
     if fmt == "csv":
         writer = csv.writer(sys.stdout, lineterminator="\n")
         if header:
@@ -982,8 +987,9 @@ def main():
     source_aliases = ", ".join(f"{k} -> {v}" for k, v in SOURCE_ALIASES.items())
     parser.add_argument(
         "--source", metavar="SOURCE", default="temurin",
-        help=f"the JDK distribution to query for GA releases: {source_names} "
+        help=f"the JDK distribution to query for GA releases: {source_names}, all "
              f"(aliases: {source_aliases}). Defaults to temurin. "
+             "'all' fetches and merges results from every source. "
              "Not available with --ea (which always uses jdk.java.net)",
     )
     args = parser.parse_args()
@@ -993,13 +999,19 @@ def main():
         parser.error("argument --auto: not allowed with --list-arch or --list-os")
     # Normalise and validate --source
     source_key = SOURCE_ALIASES.get(args.source.strip().lower(), args.source.strip().lower())
-    if source_key not in SOURCES:
+    if source_key not in SOURCES and source_key != "all":
         parser.error(f"argument --source: unknown source '{args.source}' "
-                     f"(known: {source_names}; aliases: {source_aliases})")
+                     f"(known: {source_names}, all; aliases: {source_aliases})")
     if args.early_access and source_key != "temurin":
         parser.error("argument --source: not available with --ea "
                      "(early-access builds always come from jdk.java.net)")
-    api_base, jvm_impl, source_label = SOURCES[source_key]
+    if source_key == "all" and (args.list_arch or args.list_os):
+        parser.error("argument --source all: not available with --list-arch or --list-os")
+    # For single-source mode resolve the api_base/jvm_impl/label; "all" is handled later.
+    if source_key != "all":
+        api_base, jvm_impl, source_label = SOURCES[source_key]
+    else:
+        api_base = jvm_impl = source_label = None  # resolved per-source in the fetch loop
     if args.install and not args.download:
         args.download = True
     if args.target_directory != "." and not args.download:
@@ -1041,6 +1053,7 @@ def main():
     show_bar = not args.plain and is_interactive(sys.stderr)
 
     if args.list_arch:
+        # api_base is always set here: --source all is blocked above.
         try:
             archs = get_json("/types/architectures", api=api_base)[:args.count]
         except (*NETWORK_ERRORS, ValueError) as exc:
@@ -1093,7 +1106,8 @@ def main():
             return 0
         ea["downloads"] = limit_downloads(ea["downloads"], args.count)
         rows = download_rows(ea["downloads"], major=ea["major"], version=ea["version"],
-                             build=ea["build"], released=ea["released"])
+                             build=ea["build"], released=ea["released"],
+                             source="jdk.java.net (Oracle-led OpenJDK)")
         emit({
             "source": "jdk.java.net (Oracle-led OpenJDK)",
             "arch": args.arch,
@@ -1102,38 +1116,57 @@ def main():
         }, output_format, EA_COLUMNS, rows, header, fields, color)
         return finish_downloads(rows, args, show_bar)
 
-    try:
-        info = get_json("/info/available_releases", api=api_base)
-        lts = set(info["available_lts_releases"])
-        if args.major is not None:
-            if args.major not in info["available_releases"]:
-                print(json.dumps({
-                    "error": f"major version {args.major} is not available "
-                             f"(available: {', '.join(str(m) for m in sorted(info['available_releases']))})"
-                }), file=sys.stderr)
-                return 1
-            majors = [args.major]
-        elif args.all:
-            majors = info["available_releases"]
-        else:
-            majors = sorted(lts | {info["most_recent_feature_release"]})
-        if args.lts:
-            majors = [m for m in majors if m in lts]
-        elif args.non_lts:
-            majors = [m for m in majors if m not in lts]
+    sources_to_fetch = list(SOURCES.items()) if source_key == "all" else [(source_key, SOURCES[source_key])]
 
-        releases = []
-        for major in sorted(majors, reverse=True):
-            entry = latest_for_major(major, lts, api=api_base, jvm_impl=jvm_impl)
-            if entry and (args.arch or args.os_name):
-                entry["downloads"] = filter_downloads(entry["downloads"], args.arch, args.os_name)
-                if not entry["downloads"]:
-                    continue
-            if entry:
-                releases.append(entry)
+    all_releases = []   # list of (source_label, info, releases_list) per source
+    try:
+        for sk, (ab, ji, sl) in sources_to_fetch:
+            info = get_json("/info/available_releases", api=ab)
+            lts = set(info["available_lts_releases"])
+            if args.major is not None:
+                if args.major not in info["available_releases"]:
+                    print(json.dumps({
+                        "error": f"major version {args.major} is not available from {sl} "
+                                 f"(available: {', '.join(str(m) for m in sorted(info['available_releases']))})"
+                    }), file=sys.stderr)
+                    return 1
+                majors = [args.major]
+            elif args.all:
+                majors = info["available_releases"]
+            else:
+                majors = sorted(lts | {info["most_recent_feature_release"]})
+            if args.lts:
+                majors = [m for m in majors if m in lts]
+            elif args.non_lts:
+                majors = [m for m in majors if m not in lts]
+
+            releases = []
+            for major in sorted(majors, reverse=True):
+                entry = latest_for_major(major, lts, api=ab, jvm_impl=ji)
+                if entry and (args.arch or args.os_name):
+                    entry["downloads"] = filter_downloads(entry["downloads"], args.arch, args.os_name)
+                    if not entry["downloads"]:
+                        continue
+                if entry:
+                    if source_key == "all":
+                        entry["source"] = sl
+                    releases.append(entry)
+            all_releases.append((sl, info, releases))
     except (*NETWORK_ERRORS, KeyError, ValueError) as exc:
         print(json.dumps({"error": f"failed to fetch JDK releases: {exc}"}), file=sys.stderr)
         return 1
+
+    # Merge releases from all sources into a flat list ordered by major (desc) then source order.
+    if source_key == "all":
+        merged = []
+        for _, _, releases in all_releases:
+            merged.extend(releases)
+        # stable sort by major descending so all sources for a given major are grouped together
+        merged.sort(key=lambda r: r["major"], reverse=True)
+        releases = merged
+        info = all_releases[0][1]  # use first source's info for feature/lts summary fields
+    else:
+        _, info, releases = all_releases[0]
 
     if not releases:
         print(json.dumps({
@@ -1143,24 +1176,36 @@ def main():
         return 1
 
     if args.version_only:
-        emit_versions(source_label, args.arch, args.os_name,
-                      [r["major"] for r in releases][:args.count], output_format, header)
+        seen = set()
+        unique_majors = [r["major"] for r in releases if not (r["major"] in seen or seen.add(r["major"]))]
+        label = "all sources" if source_key == "all" else source_label
+        emit_versions(label, args.arch, args.os_name,
+                      unique_majors[:args.count], output_format, header)
         return 0
 
     releases = limit_releases(releases, args.count)
-    result = {
-        "source": source_label,
-        "arch": args.arch,
-        "os": args.os_name,
-        "most_recent_feature_release": info["most_recent_feature_release"],
-        "most_recent_lts": info["most_recent_lts"],
-        "releases": releases,
-    }
+    if source_key == "all":
+        result = {
+            "sources": [sl for sl, _, _ in all_releases],
+            "arch": args.arch,
+            "os": args.os_name,
+            "releases": releases,
+        }
+    else:
+        result = {
+            "source": source_label,
+            "arch": args.arch,
+            "os": args.os_name,
+            "most_recent_feature_release": info["most_recent_feature_release"],
+            "most_recent_lts": info["most_recent_lts"],
+            "releases": releases,
+        }
     rows = [
         row for r in releases
         for row in download_rows(
             r["downloads"], major=r["major"], version=r["version"], release_name=r["release_name"],
             lts=r["lts"], released=r["released"],
+            source=r.get("source", source_label),
         )
     ]
     emit(result, output_format, RELEASE_COLUMNS, rows, header, fields, color)
