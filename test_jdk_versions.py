@@ -2645,12 +2645,30 @@ class RpmQueryTests(unittest.TestCase):
         self.assertEqual((code, out), (1, ""))
         self.assertIn("no releases with downloads", json.loads(err)["error"])
 
+    def test_rpm_defaults_to_semeru_source(self):
+        data = run_json("--rpm", "--lts", "--arch", "x64")
+        self.assertEqual(data["source"], j.SOURCES["semeru"][2])
+        for r in data["releases"]:
+            self.assertIn("linux-x64", r["downloads"])
+
     def test_rpm_auto_on_linux(self):
-        data = run_json("--source", "semeru", "--rpm", "--auto", "--lts",
+        data = run_json("--rpm", "--auto", "--lts",
                         detected=lambda: ("linux", "x64"))
         self.assertEqual((data["os"], data["arch"]), ("linux", "x64"))
         for r in data["releases"]:
             self.assertEqual(list(r["downloads"]), ["linux-x64"])
+
+    def test_rpm_auto_on_s390x(self):
+        def s390_fetch(url, accept):
+            if "/assets/latest/" in url:
+                return json.dumps([asset(21, "linux", "s390x")])
+            return fake_fetch(url, accept)
+
+        data = run_json("--rpm", "--auto", "--lts",
+                        detected=lambda: ("linux", "s390x"), fetch=s390_fetch)
+        self.assertEqual((data["os"], data["arch"]), ("linux", "s390x"))
+        for r in data["releases"]:
+            self.assertEqual(list(r["downloads"]), ["linux-s390x"])
 
     def test_rpm_with_source_all(self):
         data = run_json("--source", "all", "--rpm", "--lts")
@@ -2662,8 +2680,8 @@ class RpmQueryTests(unittest.TestCase):
 
     def test_rpm_with_source_temurin_is_an_error(self):
         code, out, err = run("--source", "temurin", "--rpm", "--lts")
-        self.assertEqual((code, out), (1, ""))
-        self.assertIn("no releases with downloads", json.loads(err)["error"])
+        self.assertEqual(code, 2)
+        self.assertIn("not available with --source temurin", err)
 
     def test_rpm_version_only(self):
         code, out, _ = run("--source", "semeru", "--rpm", "--lts", "--version-only")

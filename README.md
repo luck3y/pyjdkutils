@@ -121,12 +121,12 @@ Download the newest LTS tarball, verify its SHA-256 checksum, and save it to `jd
 python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --download --target-directory jdks
 ```
 
-Query or download IBM Semeru RPM packages directly on Linux:
+Query or download IBM Semeru RPM packages directly on Linux (`--rpm` automatically defaults `--source` to `semeru`):
 
 ```
-python3 jdk_versions.py --source semeru --rpm --auto
-python3 jdk_versions.py --source semeru --rpm --auto --download --target-directory jdks
-python3 jdk_versions.py --source semeru --rpm --auto --install
+python3 jdk_versions.py --rpm --auto
+python3 jdk_versions.py --rpm --auto --download --target-directory jdks
+python3 jdk_versions.py --rpm --auto --install
 ```
 
 On ARM64 Linux (for example a Raspberry Pi 4/5 or AWS Graviton), use `--arch aarch64`. On Alpine

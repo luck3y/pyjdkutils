@@ -112,7 +112,7 @@ MACHINE_ARCHES = {
     "aarch64": "aarch64", "arm64": "aarch64", "armv8l": "aarch64",
     "armv7l": "arm", "armv6l": "arm", "armv7": "arm", "arm": "arm",
     "i386": "x32", "i486": "x32", "i586": "x32", "i686": "x32", "x86": "x32",
-    "ppc64le": "ppc64le", "ppc64": "ppc64", "s390x": "s390x", "riscv64": "riscv64",
+    "ppc64le": "ppc64le", "ppc64": "ppc64", "s390x": "s390x", "s390": "s390x", "riscv64": "riscv64",
     "sparc64": "sparcv9",
 }
 
@@ -1138,9 +1138,9 @@ def main():
     source_names = ", ".join(SOURCES)
     source_aliases = ", ".join(f"{k} -> {v}" for k, v in SOURCE_ALIASES.items())
     parser.add_argument(
-        "--source", metavar="SOURCE", default="temurin",
+        "--source", metavar="SOURCE", default=None,
         help=f"the JDK distribution to query for GA releases: {source_names}, all "
-             f"(aliases: {source_aliases}). Defaults to temurin. "
+             f"(aliases: {source_aliases}). Defaults to temurin (or semeru when --rpm is used). "
              "'all' fetches and merges results from every source. "
              "Not available with --ea (which always uses jdk.java.net)",
     )
@@ -1161,11 +1161,18 @@ def main():
     if args.rpm and (args.list_arch or args.list_os):
         parser.error("argument --rpm: not allowed with --list-arch or --list-os")
     # Normalise and validate --source
-    source_key = SOURCE_ALIASES.get(args.source.strip().lower(), args.source.strip().lower())
-    if source_key not in SOURCES and source_key != "all":
-        parser.error(f"argument --source: unknown source '{args.source}' "
-                     f"(known: {source_names}, all; aliases: {source_aliases})")
-    if args.early_access and source_key != "temurin":
+    if args.source is None:
+        source_key = "semeru" if args.rpm else "temurin"
+    else:
+        raw_source = args.source.strip().lower()
+        source_key = SOURCE_ALIASES.get(raw_source, raw_source)
+        if source_key not in SOURCES and source_key != "all":
+            parser.error(f"argument --source: unknown source '{args.source}' "
+                         f"(known: {source_names}, all; aliases: {source_aliases})")
+        if args.rpm and source_key == "temurin":
+            parser.error("argument --rpm: not available with --source temurin "
+                         "(Eclipse Temurin does not provide RPM packages; use --source semeru)")
+    if args.early_access and args.source is not None and source_key != "temurin":
         parser.error("argument --source: not available with --ea "
                      "(early-access builds always come from jdk.java.net)")
     if args.early_access and args.rpm:
