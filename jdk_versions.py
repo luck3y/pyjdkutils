@@ -89,7 +89,7 @@ NETWORK_ERRORS = (OSError, http.client.HTTPException)
 INSTALL_ERRORS = (OSError, ValueError, tarfile.TarError, zipfile.BadZipFile, EOFError, zlib.error)
 
 # Common alternate spellings mapped to the architecture names used by the data sources.
-ARCH_ALIASES = {"amd64": "x64", "x86_64": "x64", "x86-64": "x64", "arm64": "aarch64"}
+ARCH_ALIASES = {"amd64": "x64", "x86_64": "x64", "x86-64": "x64", "arm64": "aarch64", "s390": "s390x"}
 
 
 # Alternate spellings mapped to the OS names used in this script's output
@@ -883,13 +883,14 @@ def latest_for_major(major, lts_majors, api=None, jvm_impl="hotspot", rpm=False)
             base_url = pkg_link.rsplit("/", 1)[0]
             for a in assets:
                 binary = a["binary"]
-                if binary["os"] == "linux":
+                if binary["os"] in ("linux", "aix"):
                     arch = binary["architecture"]
                     rpm_arch = "x86_64" if arch == "x64" else arch
                     rpm_name = f"ibm-semeru-open-{major}-jdk-{ver}-1.{rpm_arch}.rpm"
                     rpm_url = f"{base_url}/{rpm_name}"
-                    downloads[f"linux-{arch}"] = {
-                        "os": "linux",
+                    os_name = binary["os"]
+                    downloads[f"{os_name}-{arch}"] = {
+                        "os": os_name,
                         "arch": arch,
                         "url": rpm_url,
                         "sha256_url": f"{rpm_url}.sha256.txt",

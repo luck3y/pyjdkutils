@@ -2606,17 +2606,39 @@ class RpmQueryTests(unittest.TestCase):
                 self.assertIn(f"ibm-semeru-open-{r['major']}-jdk-", dl["url"])
 
     def test_rpm_architecture_naming(self):
-        data = run_json("--source", "semeru", "--rpm", "--major", "25")
+        def custom_fetch(url, accept):
+            if "/assets/latest/" in url:
+                return json.dumps([
+                    asset(25, "linux", "x64"),
+                    asset(25, "linux", "aarch64"),
+                    asset(25, "linux", "s390x"),
+                ])
+            return fake_fetch(url, accept)
+
+        data = run_json("--source", "semeru", "--rpm", "--major", "25", fetch=custom_fetch)
         downloads = data["releases"][0]["downloads"]
         self.assertIn("linux-x64", downloads)
         self.assertIn("linux-aarch64", downloads)
+        self.assertIn("linux-s390x", downloads)
         self.assertTrue(downloads["linux-x64"]["url"].endswith("x86_64.rpm"))
         self.assertTrue(downloads["linux-aarch64"]["url"].endswith("aarch64.rpm"))
+        self.assertTrue(downloads["linux-s390x"]["url"].endswith("s390x.rpm"))
 
     def test_rpm_filtering_by_arch_and_os(self):
         data = run_json("--source", "semeru", "--rpm", "--lts", "--arch", "x64")
         for r in data["releases"]:
             self.assertEqual(list(r["downloads"]), ["linux-x64"])
+
+    def test_rpm_s390_alias(self):
+        def s390_fetch(url, accept):
+            if "/assets/latest/" in url:
+                return json.dumps([asset(21, "linux", "s390x")])
+            return fake_fetch(url, accept)
+
+        data = run_json("--source", "semeru", "--rpm", "--lts", "--arch", "s390", fetch=s390_fetch)
+        for r in data["releases"]:
+            self.assertEqual(list(r["downloads"]), ["linux-s390x"])
+            self.assertTrue(r["downloads"]["linux-s390x"]["url"].endswith("s390x.rpm"))
 
     def test_rpm_filtering_by_non_linux_os_returns_error(self):
         code, out, err = run("--source", "semeru", "--rpm", "--os", "macos")
