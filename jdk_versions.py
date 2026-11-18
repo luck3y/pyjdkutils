@@ -10,6 +10,8 @@ Usage:
     python3 jdk_versions.py --major 21                                         # only JDK 21 (all platforms)
     python3 jdk_versions.py --major 21 --auto                                  # only JDK 21 for this machine
     python3 jdk_versions.py --source semeru --auto --lts                       # LTS Semeru (IBM) builds for this machine
+    python3 jdk_versions.py --source semeru --rpm --auto                       # IBM Semeru RPM for this machine
+    python3 jdk_versions.py --source semeru --rpm --auto --install             # download + system install via rpm
     python3 jdk_versions.py --source semeru --auto --lts --install --install-dir /java --install-prefix jdk   # download + install
     python3 jdk_versions.py --source all --auto --lts                          # LTS builds from every source for this machine
     python3 jdk_versions.py --all                                              # every available major release
@@ -645,6 +647,77 @@ def replace_directory(source, dest):
     shutil.rmtree(old, ignore_errors=True)
 
 
+def get_rpm_package_name(archive):
+    """Return the package name (NAME) for an RPM file, or parse from filename if rpm is unavailable."""
+    if shutil.which("rpm"):
+        try:
+            res = subprocess.run(
+                ["rpm", "-qp", "--queryformat", "%{NAME}", archive],
+                capture_output=True, text=True, timeout=15,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except OSError:
+            pass
+    # Fallback: parse from filename, e.g. ibm-semeru-open-21-jdk-21.0.13.0-1.x86_64.rpm
+    name = os.path.basename(archive).removesuffix(".rpm")
+    parts = name.rsplit("-", 2)
+    return parts[0] if len(parts) >= 3 else name
+
+
+def is_rpm_installed(archive):
+    """True if the RPM package in archive is already installed on the system."""
+    if not shutil.which("rpm"):
+        return False
+    pkg_name = get_rpm_package_name(archive)
+    try:
+        res = subprocess.run(["rpm", "-q", pkg_name], capture_output=True, text=True, timeout=15)
+        return res.returncode == 0
+    except OSError:
+        return False
+
+
+def find_rpm_jdk_home(pkg_name):
+    """Find the directory containing bin/java for an installed RPM package."""
+    if not shutil.which("rpm"):
+        return None
+    try:
+        res = subprocess.run(["rpm", "-ql", pkg_name], capture_output=True, text=True, timeout=15)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.endswith(("/bin/java", "/bin/java.exe")):
+                    candidate = os.path.dirname(os.path.dirname(line))
+                    if has_java(candidate):
+                        return candidate
+    except OSError:
+        pass
+    return None
+
+
+def install_rpm(archive, force=False):
+    """Install an RPM package using rpm -U (or sudo rpm -U if not root)."""
+    if not shutil.which("rpm"):
+        raise ValueError("the 'rpm' command is not available on this system")
+    pkg_name = get_rpm_package_name(archive)
+    cmd = []
+    if hasattr(os, "geteuid") and os.geteuid() != 0 and shutil.which("sudo"):
+        cmd.append("sudo")
+    cmd.extend(["rpm", "-U"])
+    if force:
+        cmd.append("--force")
+    cmd.append(archive)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except OSError as exc:
+        raise ValueError(f"could not run rpm: {exc}") from exc
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        raise ValueError(f"rpm install failed: {err}")
+    dest = find_rpm_jdk_home(pkg_name)
+    return dest if dest else pkg_name
+
+
 def install_jdk(archive, major, prefix_dir, install_prefix):
     """Unpack a downloaded JDK archive as prefix_dir/<install_prefix><major>; return that path.
 
@@ -788,7 +861,7 @@ def latest_early_access():
     }
 
 
-def latest_for_major(major, lts_majors, api=None, jvm_impl="hotspot"):
+def latest_for_major(major, lts_majors, api=None, jvm_impl="hotspot", rpm=False):
     """Return details and download links of the latest GA JDK for a major version."""
     vendor_param = "" if jvm_impl == "hotspot" else "&vendor=ibm"
     assets = get_json(f"/assets/latest/{major}/{jvm_impl}?image_type=jdk{vendor_param}", api=api)
@@ -802,15 +875,38 @@ def latest_for_major(major, lts_majors, api=None, jvm_impl="hotspot"):
     )
 
     downloads = {}
-    for a in assets:
-        binary = a["binary"]
-        os_name = "macos" if binary["os"] == "mac" else binary["os"]
-        downloads[f"{os_name}-{binary['architecture']}"] = {
-            "os": os_name,
-            "arch": binary["architecture"],
-            "url": binary["package"]["link"],
-            "sha256_url": binary["package"]["checksum_link"],
-        }
+    if rpm:
+        if jvm_impl == "openj9":
+            rname = asset.get("release_name", "")
+            ver = rname.removeprefix("jdk-") if rname.startswith("jdk-") else asset["version"]["semver"]
+            pkg_link = asset["binary"]["package"]["link"]
+            base_url = pkg_link.rsplit("/", 1)[0]
+            for a in assets:
+                binary = a["binary"]
+                if binary["os"] == "linux":
+                    arch = binary["architecture"]
+                    rpm_arch = "x86_64" if arch == "x64" else arch
+                    rpm_name = f"ibm-semeru-open-{major}-jdk-{ver}-1.{rpm_arch}.rpm"
+                    rpm_url = f"{base_url}/{rpm_name}"
+                    downloads[f"linux-{arch}"] = {
+                        "os": "linux",
+                        "arch": arch,
+                        "url": rpm_url,
+                        "sha256_url": f"{rpm_url}.sha256.txt",
+                    }
+    else:
+        for a in assets:
+            binary = a["binary"]
+            os_name = "macos" if binary["os"] == "mac" else binary["os"]
+            downloads[f"{os_name}-{binary['architecture']}"] = {
+                "os": os_name,
+                "arch": binary["architecture"],
+                "url": binary["package"]["link"],
+                "sha256_url": binary["package"]["checksum_link"],
+            }
+
+    if not downloads:
+        return None
 
     return {
         "major": major,
@@ -867,29 +963,48 @@ def finish_downloads(rows, args, show_bar):
 
         color = use_color(sys.stderr)
 
-        def installer(archive, row):
-            dest = os.path.join(args.install_dir, f"{args.install_prefix}{row['major']}")
-            if not args.force and has_java(dest):
-                msg = f"skipping install of JDK {row['major']} ({dest} already exists)"
-                print(style(msg, DIM) if color else msg, file=sys.stderr)
-                # Return None so download_all does not print "installed <dest>" for a skip.
-                result = None
-            else:
-                if os.path.isdir(dest):
-                    msg = (f"reinstalling JDK {row['major']} "
-                           f"({dest} exists but bin/java is missing)")
-                    print(style(msg, YELLOW) if color else msg, file=sys.stderr)
-                dest = install_jdk(archive, row["major"], args.install_dir, args.install_prefix)
-                result = dest
-            if args.verify_installed:
-                header = f"verifying JDK {row['major']} at {dest}"
-                print(style(header, BOLD, CYAN) if color else header, file=sys.stderr)
-                if not verify_jdk(dest, color=color):
-                    if color:
-                        print(style(f"verification failed for JDK {row['major']}", BOLD, RED),
-                              file=sys.stderr)
-                    verify_failures[0] += 1
-            return result
+        if getattr(args, "rpm", False):
+            def installer(archive, row):
+                name = filename_from_url(row["url"])
+                pkg_name = get_rpm_package_name(archive)
+                if not args.force and is_rpm_installed(archive):
+                    msg = f"skipping install of {name} ({pkg_name} is already installed)"
+                    print(style(msg, DIM) if color else msg, file=sys.stderr)
+                    return None
+                dest = install_rpm(archive, force=args.force)
+                if args.verify_installed:
+                    header = f"verifying JDK {row['major']} at {dest}"
+                    print(style(header, BOLD, CYAN) if color else header, file=sys.stderr)
+                    if not verify_jdk(dest, color=color):
+                        if color:
+                            print(style(f"verification failed for JDK {row['major']}", BOLD, RED),
+                                  file=sys.stderr)
+                        verify_failures[0] += 1
+                return dest
+        else:
+            def installer(archive, row):
+                dest = os.path.join(args.install_dir, f"{args.install_prefix}{row['major']}")
+                if not args.force and has_java(dest):
+                    msg = f"skipping install of JDK {row['major']} ({dest} already exists)"
+                    print(style(msg, DIM) if color else msg, file=sys.stderr)
+                    # Return None so download_all does not print "installed <dest>" for a skip.
+                    result = None
+                else:
+                    if os.path.isdir(dest):
+                        msg = (f"reinstalling JDK {row['major']} "
+                               f"({dest} exists but bin/java is missing)")
+                        print(style(msg, YELLOW) if color else msg, file=sys.stderr)
+                    dest = install_jdk(archive, row["major"], args.install_dir, args.install_prefix)
+                    result = dest
+                if args.verify_installed:
+                    header = f"verifying JDK {row['major']} at {dest}"
+                    print(style(header, BOLD, CYAN) if color else header, file=sys.stderr)
+                    if not verify_jdk(dest, color=color):
+                        if color:
+                            print(style(f"verification failed for JDK {row['major']}", BOLD, RED),
+                                  file=sys.stderr)
+                        verify_failures[0] += 1
+                return result
 
     code = download_all(rows, args.target_directory, show_bar, installer, force=args.force)
     return 1 if code or verify_failures[0] else 0
@@ -1014,6 +1129,11 @@ def main():
         help="show the full download URL in the table instead of the shortened …/<filename> form "
              "(CSV and JSON always contain the full URL regardless of this flag)",
     )
+    parser.add_argument(
+        "--rpm", action="store_true",
+        help="query or download RPM packages instead of archive files (.tar.gz / .zip). "
+             "Supported for IBM Semeru runtimes on Linux",
+    )
     source_names = ", ".join(SOURCES)
     source_aliases = ", ".join(f"{k} -> {v}" for k, v in SOURCE_ALIASES.items())
     parser.add_argument(
@@ -1037,6 +1157,8 @@ def main():
         parser.error("argument --version-only: not allowed with --list-arch or --list-os")
     if args.auto and (args.list_arch or args.list_os):
         parser.error("argument --auto: not allowed with --list-arch or --list-os")
+    if args.rpm and (args.list_arch or args.list_os):
+        parser.error("argument --rpm: not allowed with --list-arch or --list-os")
     # Normalise and validate --source
     source_key = SOURCE_ALIASES.get(args.source.strip().lower(), args.source.strip().lower())
     if source_key not in SOURCES and source_key != "all":
@@ -1045,6 +1167,8 @@ def main():
     if args.early_access and source_key != "temurin":
         parser.error("argument --source: not available with --ea "
                      "(early-access builds always come from jdk.java.net)")
+    if args.early_access and args.rpm:
+        parser.error("argument --rpm: not allowed with --ea (early-access builds do not have RPM packages)")
     if source_key == "all" and (args.list_arch or args.list_os):
         parser.error("argument --source all: not available with --list-arch or --list-os")
     # For single-source mode resolve the api_base/jvm_impl/label; "all" is handled later.
@@ -1061,9 +1185,14 @@ def main():
                      "--version-only")
     install_args = {"--install-dir": args.install_dir, "--install-prefix": args.install_prefix}
     if args.install:
-        for flag, value in install_args.items():
-            if value is None:
-                parser.error(f"argument --install: requires {flag}")
+        if not args.rpm:
+            for flag, value in install_args.items():
+                if value is None:
+                    parser.error(f"argument --install: requires {flag}")
+        else:
+            for flag, value in install_args.items():
+                if value is not None:
+                    parser.error(f"argument {flag}: not allowed with --rpm")
     else:
         for flag, value in install_args.items():
             if value is not None:
@@ -1183,7 +1312,7 @@ def main():
 
             releases = []
             for major in sorted(majors, reverse=True):
-                entry = latest_for_major(major, lts, api=ab, jvm_impl=ji)
+                entry = latest_for_major(major, lts, api=ab, jvm_impl=ji, rpm=args.rpm)
                 if entry and (args.arch or args.os_name):
                     entry["downloads"] = filter_downloads(entry["downloads"], args.arch, args.os_name)
                     if not entry["downloads"]:

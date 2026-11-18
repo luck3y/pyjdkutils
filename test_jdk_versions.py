@@ -2590,5 +2590,198 @@ class FetchTests(unittest.TestCase):
         self.assertTrue(j.EA_SITE.startswith("https://"))
 
 
+# ---------------------------------------------------------------------------------------------
+# --rpm
+# ---------------------------------------------------------------------------------------------
+
+class RpmQueryTests(unittest.TestCase):
+    def test_rpm_json_structure(self):
+        data = run_json("--source", "semeru", "--rpm", "--lts")
+        self.assertEqual(data["source"], j.SOURCES["semeru"][2])
+        for r in data["releases"]:
+            for dl in r["downloads"].values():
+                self.assertEqual(dl["os"], "linux")
+                self.assertTrue(dl["url"].endswith(".rpm"))
+                self.assertTrue(dl["sha256_url"].endswith(".rpm.sha256.txt"))
+                self.assertIn(f"ibm-semeru-open-{r['major']}-jdk-", dl["url"])
+
+    def test_rpm_architecture_naming(self):
+        data = run_json("--source", "semeru", "--rpm", "--major", "25")
+        downloads = data["releases"][0]["downloads"]
+        self.assertIn("linux-x64", downloads)
+        self.assertIn("linux-aarch64", downloads)
+        self.assertTrue(downloads["linux-x64"]["url"].endswith("x86_64.rpm"))
+        self.assertTrue(downloads["linux-aarch64"]["url"].endswith("aarch64.rpm"))
+
+    def test_rpm_filtering_by_arch_and_os(self):
+        data = run_json("--source", "semeru", "--rpm", "--lts", "--arch", "x64")
+        for r in data["releases"]:
+            self.assertEqual(list(r["downloads"]), ["linux-x64"])
+
+    def test_rpm_filtering_by_non_linux_os_returns_error(self):
+        code, out, err = run("--source", "semeru", "--rpm", "--os", "macos")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no releases with downloads", json.loads(err)["error"])
+
+    def test_rpm_auto_on_linux(self):
+        data = run_json("--source", "semeru", "--rpm", "--auto", "--lts",
+                        detected=lambda: ("linux", "x64"))
+        self.assertEqual((data["os"], data["arch"]), ("linux", "x64"))
+        for r in data["releases"]:
+            self.assertEqual(list(r["downloads"]), ["linux-x64"])
+
+    def test_rpm_with_source_all(self):
+        data = run_json("--source", "all", "--rpm", "--lts")
+        # Temurin has no RPMs, so only Semeru releases are present
+        for r in data["releases"]:
+            self.assertEqual(r["source"], j.SOURCES["semeru"][2])
+            for dl in r["downloads"].values():
+                self.assertTrue(dl["url"].endswith(".rpm"))
+
+    def test_rpm_with_source_temurin_is_an_error(self):
+        code, out, err = run("--source", "temurin", "--rpm", "--lts")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no releases with downloads", json.loads(err)["error"])
+
+    def test_rpm_version_only(self):
+        code, out, _ = run("--source", "semeru", "--rpm", "--lts", "--version-only")
+        self.assertEqual(code, 0)
+        versions = [int(v) for v in out.strip().splitlines() if v]
+        self.assertEqual(versions, [25, 21, 17, 8])
+
+    def test_rpm_csv_and_table(self):
+        rows = run_csv("--source", "semeru", "--rpm", "--lts", "--count", "1")
+        self.assertEqual(rows[0], j.RELEASE_COLUMNS)
+        self.assertTrue(rows[1][8].endswith(".rpm"))
+        self.assertTrue(rows[1][9].endswith(".rpm.sha256.txt"))
+        code, out, _ = run("--source", "semeru", "--rpm", "--lts", "--count", "1")
+        self.assertEqual(code, 0)
+        self.assertIn(".rpm", out)
+
+
+class RpmValidationTests(unittest.TestCase):
+    def assert_rejected(self, *argv):
+        code, out, err = run(*argv, fetch=raising(AssertionError("no network!")))
+        self.assertEqual(code, 2, f"{argv} should be rejected (stderr: {err})")
+        self.assertEqual(out, "")
+
+    def test_rpm_rejected_with_ea(self):
+        self.assert_rejected("--ea", "--rpm")
+
+    def test_rpm_rejected_with_list_arch_or_os(self):
+        self.assert_rejected("--list-arch", "--rpm")
+        self.assert_rejected("--list-os", "--rpm")
+
+    def test_rpm_install_rejects_install_dir_and_prefix(self):
+        self.assert_rejected("--source", "semeru", "--rpm", "--install", "--install-dir", "/java")
+        self.assert_rejected("--source", "semeru", "--rpm", "--install", "--install-prefix", "jdk")
+
+
+class RpmDownloadAndInstallTests(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.dl = self.path("dl")
+
+    def test_rpm_download(self):
+        fetch, urlopen = archive_world()
+        with mock.patch.object(j.urllib.request, "urlopen", urlopen):
+            code, _, err = run("--source", "semeru", "--rpm", "--lts", "--arch", "x64", "--count", "1",
+                               "--plain", "--download", "--target-directory", self.dl, fetch=fetch)
+        self.assertEqual(code, 0, err)
+        files = os.listdir(self.dl)
+        self.assertEqual(len(files), 1)
+        self.assertTrue(files[0].endswith(".x86_64.rpm"))
+        self.assertIn("downloaded 1 of 1 file(s)", err)
+
+    def test_rpm_helpers(self):
+        # get_rpm_package_name
+        self.assertEqual(
+            j.get_rpm_package_name("/path/to/ibm-semeru-open-21-jdk-21.0.13.0-1.x86_64.rpm"),
+            "ibm-semeru-open-21-jdk",
+        )
+
+        # is_rpm_installed fallback when rpm is mocked
+        with mock.patch.object(j.shutil, "which", return_value="/usr/bin/rpm"), \
+                mock.patch.object(j.subprocess, "run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="ibm-semeru-open-21-jdk\n")
+            self.assertTrue(j.is_rpm_installed("ibm-semeru-open-21-jdk-21.0.13.0-1.x86_64.rpm"))
+
+            mock_run.return_value = mock.Mock(returncode=1, stdout="")
+            self.assertFalse(j.is_rpm_installed("ibm-semeru-open-21-jdk-21.0.13.0-1.x86_64.rpm"))
+
+    def test_install_rpm_calls_rpm_u(self):
+        with mock.patch.object(j.shutil, "which", return_value="/usr/bin/rpm"), \
+                mock.patch.object(j.os, "geteuid", return_value=0), \
+                mock.patch.object(j.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                mock.Mock(returncode=0, stdout="ibm-semeru-open-21-jdk\n"),  # get_rpm_package_name
+                mock.Mock(returncode=0, stdout=""),  # rpm -U
+                mock.Mock(returncode=0, stdout="/usr/lib/jvm/ibm-semeru-open-21-jdk/bin/java\n"),  # find_rpm_jdk_home
+            ]
+            with mock.patch.object(j, "has_java", return_value=True):
+                dest = j.install_rpm("/path/to/pkg.rpm")
+            self.assertEqual(dest, "/usr/lib/jvm/ibm-semeru-open-21-jdk")
+
+            # Check that rpm -U was called with pkg.rpm
+            rpm_call = mock_run.call_args_list[1]
+            self.assertEqual(rpm_call.args[0], ["rpm", "-U", "/path/to/pkg.rpm"])
+
+    def test_install_rpm_uses_sudo_when_non_root(self):
+        def fake_which(cmd):
+            return f"/usr/bin/{cmd}"
+
+        with mock.patch.object(j.shutil, "which", side_effect=fake_which), \
+                mock.patch.object(j.os, "geteuid", return_value=1000), \
+                mock.patch.object(j.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                mock.Mock(returncode=0, stdout="ibm-semeru-open-21-jdk\n"),
+                mock.Mock(returncode=0, stdout=""),
+                mock.Mock(returncode=1, stdout=""),
+            ]
+            dest = j.install_rpm("/path/to/pkg.rpm", force=True)
+            self.assertEqual(dest, "ibm-semeru-open-21-jdk")
+            rpm_call = mock_run.call_args_list[1]
+            self.assertEqual(rpm_call.args[0], ["sudo", "rpm", "-U", "--force", "/path/to/pkg.rpm"])
+
+    def test_install_rpm_missing_command_raises(self):
+        with mock.patch.object(j.shutil, "which", return_value=None):
+            with self.assertRaises(ValueError) as caught:
+                j.install_rpm("/path/to/pkg.rpm")
+            self.assertIn("not available", str(caught.exception))
+
+    def test_install_rpm_failure_raises(self):
+        with mock.patch.object(j.shutil, "which", return_value="/usr/bin/rpm"), \
+                mock.patch.object(j.os, "geteuid", return_value=0), \
+                mock.patch.object(j.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                mock.Mock(returncode=0, stdout="ibm-semeru-open-21-jdk\n"),
+                mock.Mock(returncode=1, stderr="error: Failed dependencies", stdout=""),
+            ]
+            with self.assertRaises(ValueError) as caught:
+                j.install_rpm("/path/to/pkg.rpm")
+            self.assertIn("Failed dependencies", str(caught.exception))
+
+    def test_rpm_install_end_to_end(self):
+        fetch, urlopen = archive_world()
+        with mock.patch.object(j.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(j, "is_rpm_installed", return_value=False), \
+                mock.patch.object(j, "install_rpm", return_value="/usr/lib/jvm/ibm-semeru-open-25-jdk"):
+            code, _, err = run("--source", "semeru", "--rpm", "--lts", "--arch", "x64", "--count", "1",
+                               "--plain", "--install", "--target-directory", self.dl, fetch=fetch)
+        self.assertEqual(code, 0, err)
+        self.assertIn("installed /usr/lib/jvm/ibm-semeru-open-25-jdk", err)
+        self.assertIn("installed 1 of 1 JDK(s)", err)
+
+    def test_rpm_install_skips_when_already_installed(self):
+        fetch, urlopen = archive_world()
+        with mock.patch.object(j.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(j, "is_rpm_installed", return_value=True):
+            code, _, err = run("--source", "semeru", "--rpm", "--lts", "--arch", "x64", "--count", "1",
+                               "--plain", "--install", "--target-directory", self.dl, fetch=fetch)
+        self.assertEqual(code, 0, err)
+        self.assertIn("skipping install of", err)
+        self.assertIn("already installed", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

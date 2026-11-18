@@ -121,6 +121,14 @@ Download the newest LTS tarball, verify its SHA-256 checksum, and save it to `jd
 python3 jdk_versions.py --lts --os linux --arch x64 --count 1 --download --target-directory jdks
 ```
 
+Query or download IBM Semeru RPM packages directly on Linux:
+
+```
+python3 jdk_versions.py --source semeru --rpm --auto
+python3 jdk_versions.py --source semeru --rpm --auto --download --target-directory jdks
+python3 jdk_versions.py --source semeru --rpm --auto --install
+```
+
 On ARM64 Linux (for example a Raspberry Pi 4/5 or AWS Graviton), use `--arch aarch64`. On Alpine
 Linux use `--os alpine-linux`, which needs its own musl builds. `--os linux` does not include them.
 
@@ -209,6 +217,7 @@ python3 jdk_versions.py --ea --version-only          # 28
 | `--arch ARCH` | Keeps only downloads for this architecture. See [Platform names](#platform-names). |
 | `--os OS` | Keeps only downloads for this operating system. See [Platform names](#platform-names). |
 | `--auto` | Detects this machine's OS and architecture and filters for them. An explicit `--os` or `--arch` takes precedence over the detected value. |
+| `--rpm` | Queries or downloads RPM packages instead of archive files (`.tar.gz` / `.zip`). Supported for IBM Semeru runtimes on Linux. When used with `--install`, performs a system installation via `rpm -U` / `sudo rpm -U` without requiring `--install-dir` or `--install-prefix`. |
 | `--full-url` | Shows the complete download URL in the table instead of the default `…/<filename>` form. Has no effect on CSV or JSON output, which always contain the full URL. |
 | `--count N` | Returns only the first `N` rows. See [How filtering and `--count` work](#how-filtering-and---count-work). |
 | `--version-only` | Returns only the major version numbers. |
@@ -237,9 +246,10 @@ Rules for combining options:
 - `--target-directory` without `--download` is an error. `--download` without `--target-directory`
   saves to the current directory. `--download` cannot be used with `--version-only`, `--list-arch`
   or `--list-os`.
-- `--install` implies `--download`. It requires `--install-dir` and `--install-prefix`;
+- `--install` implies `--download`. For archive installations it requires `--install-dir` and `--install-prefix`;
   `--target-directory` defaults to `.` as usual. `--install-dir` and `--install-prefix` cannot be
-  used without `--install`.
+  used without `--install` or with `--rpm`.
+- `--rpm` is supported for Linux RPMs (e.g. `--source semeru`). It cannot be used with `--ea`, `--list-arch` or `--list-os`.
 - `--force` only has an effect when `--download` or `--install` is also given.
 - `--verify-installed` requires `--install`.
 - `--full-url` only affects table output; it has no effect with `--csv` or `--json`.
@@ -436,6 +446,9 @@ python3 jdk_versions.py --auto --lts --count 1 \
   `installed N of M JDK(s)`. The listing on stdout is unchanged.
 - Unpacking requires Python 3.11.4 or later for the tar extraction filters in the `tarfile` module.
   A Python without them reports an install error instead of unpacking without protection.
+- **RPM system installations (`--rpm --install`)** use `rpm -U` (invoking `sudo` if run as a non-root user).
+  Re-running skips packages that are already installed on the system unless `--force` is specified.
+  `--install-dir` and `--install-prefix` are not needed for `--rpm` installations since RPM packages manage their own system install paths.
 
 ## Colors and the progress bar
 
